@@ -4,6 +4,7 @@
 #include <time.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "src/core/tensor.h"
 #include "src/core/metal_backend.h"
@@ -604,6 +605,12 @@ static void run_serve(Config *cfg) {
         return;
     }
 
+    // Redirect stdout→stderr so printf() from model loading doesn't corrupt
+    // the binary pipe. Save original stdout fd for binary responses.
+    int stdout_fd = dup(STDOUT_FILENO);
+    dup2(STDERR_FILENO, STDOUT_FILENO);
+    FILE *bin_out = fdopen(stdout_fd, "wb");
+
     ModelType mtype = detect_model_type(cfg->gguf_path);
     fprintf(stderr, "[Serve] Loading model (%s): %s\n",
             mtype == MODEL_GEMMA3 ? "gemma3" : "qwen3", cfg->gguf_path);
@@ -674,9 +681,9 @@ static void run_serve(Config *cfg) {
                                         output_buf, (int)max_gen);
 
         uint32_t n = (uint32_t)n_gen;
-        fwrite(&n, sizeof(uint32_t), 1, stdout);
-        fwrite(output_buf, sizeof(uint32_t), n_gen, stdout);
-        fflush(stdout);
+        fwrite(&n, sizeof(uint32_t), 1, bin_out);
+        fwrite(output_buf, sizeof(uint32_t), n_gen, bin_out);
+        fflush(bin_out);
 
         fprintf(stderr, "[Serve] Response: %d tokens generated\n", n_gen);
     }

@@ -122,7 +122,7 @@ static InferenceState *inference_state_init_common(
         return NULL;
     }
     if (max_seq_len > 4096) {
-        printf("[FastGen] Warning: clamping max_seq_len to 4096 (kernel limit)\n");
+        fprintf(stderr, "[FastGen] Warning: clamping max_seq_len to 4096 (kernel limit)\n");
         max_seq_len = 4096;
     }
 
@@ -172,7 +172,7 @@ static InferenceState *inference_state_init_common(
 
     // Convert and upload weights
     const char *mode_str = use_fp16 ? "F16" : "Q8_0";
-    printf("[FastGen] Converting weights to %s + uploading to GPU...\n", mode_str);
+    fprintf(stderr, "[FastGen] Converting weights to %s + uploading to GPU...\n", mode_str);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -183,7 +183,7 @@ static InferenceState *inference_state_init_common(
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
-    printf("[FastGen] %s + GPU upload: %.0f ms\n", mode_str, ms);
+    fprintf(stderr, "[FastGen] %s + GPU upload: %.0f ms\n", mode_str, ms);
 
     // Print weight memory usage
     if (use_fp16) {
@@ -200,7 +200,7 @@ static InferenceState *inference_state_init_common(
         }
         total_params += (size_t)s->lm_head->rows * s->lm_head->cols;
         double weight_mb = (double)(total_params * 2) / (1024.0 * 1024.0);
-        printf("[FastGen] F16 weight memory: %.1f MB (%.2f GB)\n",
+        fprintf(stderr, "[FastGen] F16 weight memory: %.1f MB (%.2f GB)\n",
                weight_mb, weight_mb / 1024.0);
     }
 
@@ -374,7 +374,7 @@ int inference_generate(InferenceState *state,
     struct timespec t0, t1;
 
     // Prefill
-    printf("[FastGen] Prefilling %d tokens...\n", prompt_len);
+    fprintf(stderr, "[FastGen] Prefilling %d tokens...\n", prompt_len);
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     for (int i = 0; i < prompt_len; i++) {
@@ -384,7 +384,7 @@ int inference_generate(InferenceState *state,
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double prefill_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
-    printf("[FastGen] Prefill: %.0f ms (%.1f tok/s)\n",
+    fprintf(stderr, "[FastGen] Prefill: %.0f ms (%.1f tok/s)\n",
            prefill_ms, prompt_len * 1000.0 / prefill_ms);
 
     // First generated token
@@ -396,7 +396,7 @@ int inference_generate(InferenceState *state,
     int eos1, eos2, eos3;
     if (s->model_type == MODEL_GEMMA3) {
         eos1 = 1;      // <eos>
-        eos2 = 107;    // <end_of_turn>
+        eos2 = 106;    // <end_of_turn>
         eos3 = -1;     // no third EOS
     } else {
         eos1 = 151645;  // <|endoftext|>
@@ -405,7 +405,7 @@ int inference_generate(InferenceState *state,
     }
 
     // Decode
-    printf("[FastGen] Decoding...\n");
+    fprintf(stderr, "[FastGen] Decoding...\n");
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     for (int gen = 1; gen < max_gen_len && s->cur_len < s->max_seq_len; gen++) {
@@ -420,7 +420,7 @@ int inference_generate(InferenceState *state,
         if (n_gen % 10 == 0) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
             double elapsed = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
-            printf("[FastGen]   %d tokens, %.1f tok/s\n",
+            fprintf(stderr, "[FastGen]   %d tokens, %.1f tok/s\n",
                    n_gen - 1, (n_gen - 1) * 1000.0 / elapsed);
         }
     }
@@ -429,7 +429,7 @@ int inference_generate(InferenceState *state,
     double decode_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     int n_decoded = n_gen - 1;
     if (n_decoded > 0) {
-        printf("[FastGen] Decode: %d tokens in %.0f ms (%.1f tok/s, %.0f ms/tok)\n",
+        fprintf(stderr, "[FastGen] Decode: %d tokens in %.0f ms (%.1f tok/s, %.0f ms/tok)\n",
                n_decoded, decode_ms, n_decoded * 1000.0 / decode_ms,
                decode_ms / n_decoded);
     }
@@ -531,7 +531,7 @@ static BatchState *batch_state_create(Qwen3Model *m, int max_seq_len, int B) {
     s->cur_len = 0;
 
     // Convert weights to F16
-    printf("[BatchGen] Converting weights to F16 (batch=%d)...\n", B);
+    fprintf(stderr, "[BatchGen] Converting weights to F16 (batch=%d)...\n", B);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -544,7 +544,7 @@ static BatchState *batch_state_create(Qwen3Model *m, int max_seq_len, int B) {
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
-    printf("[BatchGen] F16 + GPU upload: %.0f ms\n", ms);
+    fprintf(stderr, "[BatchGen] F16 + GPU upload: %.0f ms\n", ms);
     return s;
 }
 
@@ -668,7 +668,7 @@ int qwen3_generate_fast_batch(Qwen3Model *model, const uint32_t *prompt_tokens,
     struct timespec t0, t1;
 
     // Prefill (single sequence, then copy KV cache to all B items)
-    printf("[BatchGen] Prefilling %d tokens...\n", prompt_len);
+    fprintf(stderr, "[BatchGen] Prefilling %d tokens...\n", prompt_len);
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     int V = s->vocab_size;
@@ -683,7 +683,7 @@ int qwen3_generate_fast_batch(Qwen3Model *model, const uint32_t *prompt_tokens,
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double prefill_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
-    printf("[BatchGen] Prefill: %.0f ms (%.1f tok/s)\n",
+    fprintf(stderr, "[BatchGen] Prefill: %.0f ms (%.1f tok/s)\n",
            prefill_ms, prompt_len * 1000.0 / prefill_ms);
 
     // First generated token (same for all B since same prompt)
@@ -697,7 +697,7 @@ int qwen3_generate_fast_batch(Qwen3Model *model, const uint32_t *prompt_tokens,
     for (int b = 0; b < B; b++) active[b] = 1;
 
     // Decode loop — B tokens per step
-    printf("[BatchGen] Decoding (batch=%d)...\n", B);
+    fprintf(stderr, "[BatchGen] Decoding (batch=%d)...\n", B);
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     for (int gen = 1; gen < max_gen_len && s->cur_len < max_seq_len; gen++) {
@@ -725,7 +725,7 @@ int qwen3_generate_fast_batch(Qwen3Model *model, const uint32_t *prompt_tokens,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             double elapsed = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
             int total_tok = (n_gen - 1) * B;
-            printf("[BatchGen]   %d steps, %d total tok, %.1f tok/s (%.1f ms/step)\n",
+            fprintf(stderr, "[BatchGen]   %d steps, %d total tok, %.1f tok/s (%.1f ms/step)\n",
                    n_gen - 1, total_tok, total_tok * 1000.0 / elapsed,
                    elapsed / (n_gen - 1));
         }
@@ -736,10 +736,10 @@ int qwen3_generate_fast_batch(Qwen3Model *model, const uint32_t *prompt_tokens,
     int n_decoded = n_gen - 1;
     if (n_decoded > 0) {
         int total_tok = n_decoded * B;
-        printf("[BatchGen] Decode: %d steps x %d batch = %d tokens in %.0f ms\n",
+        fprintf(stderr, "[BatchGen] Decode: %d steps x %d batch = %d tokens in %.0f ms\n",
                n_decoded, B, total_tok, decode_ms);
-        printf("[BatchGen]   Throughput: %.1f tok/s\n", total_tok * 1000.0 / decode_ms);
-        printf("[BatchGen]   Latency: %.0f ms/step\n", decode_ms / n_decoded);
+        fprintf(stderr, "[BatchGen]   Throughput: %.1f tok/s\n", total_tok * 1000.0 / decode_ms);
+        fprintf(stderr, "[BatchGen]   Latency: %.0f ms/step\n", decode_ms / n_decoded);
     }
 
     batch_state_free(s);
