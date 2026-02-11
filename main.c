@@ -536,6 +536,7 @@ static void run_generate(Config *cfg) {
             gemma3_free(model); free(tokens); free(gen_tokens);
             return;
         }
+        inference_state_load_eos(state, cfg->gguf_path);
         n_generated = inference_generate(state, tokens, prompt_len,
                                           gen_tokens, cfg->max_gen_len);
         inference_state_free(state);
@@ -643,6 +644,7 @@ static void run_serve(Config *cfg) {
         else qwen3_free(model_ptr);
         return;
     }
+    inference_state_load_eos(state, cfg->gguf_path);
 
     fprintf(stderr, "[Serve] Ready. Waiting for requests on stdin...\n");
     fflush(stderr);

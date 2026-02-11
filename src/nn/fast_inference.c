@@ -6,6 +6,47 @@
 #include <stdio.h>
 #include <math.h>
 #include <time.h>
+#include <sys/stat.h>
+
+// Parse eos_token_id from config.json — supports int or array of ints.
+// Returns count of EOS tokens found (0 if not found).
+static int parse_eos_from_config(const char *model_path, int *eos_out, int max_eos) {
+    char config_path[600];
+    struct stat st;
+    if (stat(model_path, &st) == 0 && S_ISDIR(st.st_mode))
+        snprintf(config_path, sizeof(config_path), "%s/config.json", model_path);
+    else {
+        const char *sl = strrchr(model_path, '/');
+        if (sl) snprintf(config_path, sizeof(config_path), "%.*s/config.json", (int)(sl - model_path), model_path);
+        else    snprintf(config_path, sizeof(config_path), "config.json");
+    }
+    FILE *fp = fopen(config_path, "r");
+    if (!fp) return 0;
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+
+    const char *key = strstr(buf, "\"eos_token_id\"");
+    if (!key) return 0;
+    const char *p = key + strlen("\"eos_token_id\"");
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+
+    int count = 0;
+    if (*p == '[') {
+        // Array: [1, 106]
+        p++;
+        while (*p && *p != ']' && count < max_eos) {
+            while (*p == ' ' || *p == ',' || *p == '\n') p++;
+            if (*p == ']') break;
+            eos_out[count++] = (int)strtol(p, (char **)&p, 10);
+        }
+    } else {
+        // Single int
+        eos_out[count++] = (int)strtol(p, NULL, 10);
+    }
+    return count;
+}
 
 struct InferenceState {
     int d_model, n_q_heads, n_kv_heads, head_dim, intermediate_size, vocab_size;
@@ -15,6 +56,10 @@ struct InferenceState {
 
     // Per-layer RoPE theta (Gemma3 hybrid: local vs global)
     float *rope_thetas;  // [n_layers]
+
+    // EOS tokens (read from config.json)
+    int eos_tokens[4];
+    int n_eos;
 
     // Metal scratch buffers
     MetalBuf *mb_x, *mb_x2, *mb_ln_out;
@@ -138,6 +183,13 @@ static InferenceState *inference_state_init_common(
     s->use_fp16 = use_fp16;
     s->model_type = model_type;
 
+    // Default EOS (overridden by inference_state_load_eos)
+    if (model_type == MODEL_GEMMA3) {
+        s->eos_tokens[0] = 1;    s->eos_tokens[1] = 106;  s->n_eos = 2;
+    } else {
+        s->eos_tokens[0] = 151645; s->eos_tokens[1] = 151643; s->n_eos = 2;
+    }
+
     // Per-layer rope thetas
     s->rope_thetas = malloc(n_layers * sizeof(float));
     memcpy(s->rope_thetas, rope_thetas_src, n_layers * sizeof(float));
@@ -252,6 +304,26 @@ InferenceState *inference_state_create_gemma3(Gemma3Model *m, int max_seq_len, i
 
 ModelType inference_state_model_type(InferenceState *state) {
     return state->model_type;
+}
+
+void inference_state_load_eos(InferenceState *state, const char *model_path) {
+    state->n_eos = parse_eos_from_config(model_path, state->eos_tokens, 4);
+    if (state->n_eos == 0) {
+        // Fallback defaults
+        if (state->model_type == MODEL_GEMMA3) {
+            state->eos_tokens[0] = 1;    // <eos>
+            state->eos_tokens[1] = 106;  // <end_of_turn>
+            state->n_eos = 2;
+        } else {
+            state->eos_tokens[0] = 151645;  // <|endoftext|>
+            state->eos_tokens[1] = 151643;  // <|im_end|>
+            state->n_eos = 2;
+        }
+    }
+    fprintf(stderr, "[FastGen] EOS tokens (%d):", state->n_eos);
+    for (int i = 0; i < state->n_eos; i++)
+        fprintf(stderr, " %d", state->eos_tokens[i]);
+    fprintf(stderr, "\n");
 }
 
 void inference_state_free(InferenceState *s) {
@@ -392,24 +464,15 @@ int inference_generate(InferenceState *state,
     output_tokens[0] = (uint32_t)next_token;
     int n_gen = 1;
 
-    // EOS tokens depend on model type
-    int eos1, eos2, eos3;
-    if (s->model_type == MODEL_GEMMA3) {
-        eos1 = 1;      // <eos>
-        eos2 = 106;    // <end_of_turn>
-        eos3 = -1;     // no third EOS
-    } else {
-        eos1 = 151645;  // <|endoftext|>
-        eos2 = 151643;  // <|im_end|>
-        eos3 = 0;
-    }
-
     // Decode
     fprintf(stderr, "[FastGen] Decoding...\n");
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     for (int gen = 1; gen < max_gen_len && s->cur_len < s->max_seq_len; gen++) {
-        if (next_token == eos1 || next_token == eos2 || next_token == eos3) break;
+        int is_eos = 0;
+        for (int e = 0; e < s->n_eos; e++)
+            if (next_token == s->eos_tokens[e]) { is_eos = 1; break; }
+        if (is_eos) break;
 
         forward_token(s, next_token, s->cur_len);
         s->cur_len++;

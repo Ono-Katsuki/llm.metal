@@ -29,6 +29,10 @@ int inference_generate(InferenceState *state,
 // Get model type of inference state.
 ModelType inference_state_model_type(InferenceState *state);
 
+// Load EOS token IDs from model's config.json.
+// Call after create — auto-detects eos_token_id (int or array).
+void inference_state_load_eos(InferenceState *state, const char *model_path);
+
 // ==================================================================
 // One-shot convenience wrappers
 // ==================================================================
