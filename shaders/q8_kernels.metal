@@ -344,6 +344,25 @@ kernel void silu_mul(
 }
 
 // ===================================================================
+// GELU(gate) * up — fused element-wise (for Gemma3 GeGLU)
+// GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// ===================================================================
+
+kernel void gelu_mul(
+    device float *gate        [[buffer(0)]],
+    device const float *up    [[buffer(1)]],
+    uint i [[thread_position_in_grid]])
+{
+    float g = gate[i];
+    float g3 = g * g * g;
+    float inner = 0.7978845608f * (g + 0.044715f * g3);
+    // Clamp to avoid Metal fast-math tanh returning NaN for large |inner|
+    inner = clamp(inner, -15.0f, 15.0f);
+    float gelu = 0.5f * g * (1.0f + tanh(inner));
+    gate[i] = gelu * up[i];
+}
+
+// ===================================================================
 // Residual add: x += y
 // ===================================================================
 
@@ -534,6 +553,30 @@ kernel void silu_mul_backward(
     float silu_grad = sig * (1.0f + g * (1.0f - sig));
     dgate[i] = dy * u * silu_grad;
     dup[i] = dy * silu_g;
+}
+
+// GELU*mul backward: given d_out, gate_pre_gelu, up
+// d_gate = d_out * up * gelu'(gate)
+// d_up   = d_out * gelu(gate)
+kernel void gelu_mul_backward(
+    device const float *dout  [[buffer(0)]],
+    device const float *gate  [[buffer(1)]],
+    device const float *up    [[buffer(2)]],
+    device float *dgate       [[buffer(3)]],
+    device float *dup         [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    float g = gate[i], u = up[i], dy = dout[i];
+    float g3 = g * g * g;
+    float inner = 0.7978845608f * (g + 0.044715f * g3);
+    inner = clamp(inner, -15.0f, 15.0f);  // Metal fast-math tanh NaN avoidance
+    float tanh_inner = tanh(inner);
+    float gelu_g = 0.5f * g * (1.0f + tanh_inner);
+    float sech2 = 1.0f - tanh_inner * tanh_inner;
+    float gelu_grad = 0.5f * (1.0f + tanh_inner)
+                    + 0.5f * g * sech2 * 0.7978845608f * (1.0f + 3.0f * 0.044715f * g * g);
+    dgate[i] = dy * u * gelu_grad;
+    dup[i] = dy * gelu_g;
 }
 
 // RMSNorm backward for training (batched)

@@ -2,6 +2,7 @@
 #define FAST_SFT_H
 
 #include "qwen3.h"
+#include "gemma3.h"
 
 // Fast SFT training with Metal GPU acceleration.
 // Forward + backward pass in single GPU submission (no CPU-GPU sync overhead).
@@ -12,6 +13,11 @@ typedef struct SFTState SFTState;
 // LoRA A/B are stored as float on GPU.
 SFTState *sft_state_create(Qwen3Model *model, int seq_len,
                            int lora_rank, float lora_alpha);
+
+// Create SFT training state for Gemma3 model.
+SFTState *sft_state_create_gemma3(Gemma3Model *model, int seq_len,
+                                   int lora_rank, float lora_alpha);
+
 void sft_state_free(SFTState *state);
 
 // Run one SFT training step (forward + loss + backward + weight update).
@@ -24,5 +30,6 @@ float sft_train_step(SFTState *state, const uint32_t *input_tokens,
 
 // Sync LoRA weights from GPU back to model (for saving adapter).
 void sft_sync_lora_to_model(SFTState *state, Qwen3Model *model);
+void sft_sync_lora_to_gemma3(SFTState *state, Gemma3Model *model);
 
 #endif // FAST_SFT_H

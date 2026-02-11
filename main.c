@@ -11,6 +11,7 @@
 #include "src/nn/transformer.h"
 #include "src/nn/optimizer.h"
 #include "src/nn/qwen3.h"
+#include "src/nn/gemma3.h"
 #include "src/nn/fast_inference.h"
 #include "src/nn/fast_sft.h"
 #include "src/data/tokenizer.h"
@@ -161,8 +162,8 @@ static void print_usage(const char *prog) {
     printf("  --checkpoint <dir>  Checkpoint directory\n");
     printf("  --resume <path>     Resume from checkpoint\n");
     printf("  --test              Run in test mode (random data)\n\n");
-    printf("Qwen3 SFT options:\n");
-    printf("  --model <path>      Model file/dir (.gguf or .safetensors)\n");
+    printf("Qwen3/Gemma3 SFT options:\n");
+    printf("  --model <path>      Model file/dir (.gguf or .safetensors, auto-detects model type)\n");
     printf("  --gguf <path>       GGUF model file (alias for --model)\n");
     printf("  --lora-rank <n>     LoRA rank (default: 16)\n");
     printf("  --lora-alpha <f>    LoRA alpha (default: 32)\n");
@@ -240,21 +241,85 @@ static Config parse_args(int argc, char **argv) {
 }
 
 // ==================================================================
-// Auto-detect model format
+// Auto-detect model type from config.json
 // ==================================================================
 
-static Qwen3Model *load_model_auto(const char *path) {
+// Try to detect model_type from config.json in the model directory.
+// Returns MODEL_QWEN3 by default if detection fails.
+static ModelType detect_model_type(const char *path) {
+    char config_path[600];
+    struct stat st2;
+
+    // If path is a directory, look for config.json inside
+    if (stat(path, &st2) == 0 && S_ISDIR(st2.st_mode)) {
+        snprintf(config_path, sizeof(config_path), "%s/config.json", path);
+    } else {
+        // If path is a file, look for config.json in parent directory
+        const char *last_slash = strrchr(path, '/');
+        if (last_slash) {
+            size_t dir_len = (size_t)(last_slash - path);
+            snprintf(config_path, sizeof(config_path), "%.*s/config.json", (int)dir_len, path);
+        } else {
+            snprintf(config_path, sizeof(config_path), "config.json");
+        }
+    }
+
+    FILE *fp = fopen(config_path, "r");
+    if (!fp) return MODEL_QWEN3;  // default
+
+    // Simple substring search in config.json for "model_type"
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+
+    if (strstr(buf, "\"gemma3") || strstr(buf, "\"gemma2")) {
+        printf("[Model] Detected model_type: gemma3 (from config.json)\n");
+        return MODEL_GEMMA3;
+    }
+    if (strstr(buf, "\"qwen3") || strstr(buf, "\"qwen2")) {
+        printf("[Model] Detected model_type: qwen3 (from config.json)\n");
+        return MODEL_QWEN3;
+    }
+
+    return MODEL_QWEN3;  // default
+}
+
+static Qwen3Model *load_qwen3_auto(const char *path) {
     struct stat _st;
     if (stat(path, &_st) == 0 && S_ISDIR(_st.st_mode)) {
-        printf("[Model] Loading safetensors from directory: %s\n", path);
+        printf("[Model] Loading Qwen3 safetensors from directory: %s\n", path);
         return qwen3_load_safetensors(path);
     }
     size_t len = strlen(path);
     if (len > 12 && strcmp(path + len - 12, ".safetensors") == 0) {
-        printf("[Model] Loading safetensors: %s\n", path);
+        printf("[Model] Loading Qwen3 safetensors: %s\n", path);
         return qwen3_load_safetensors(path);
     }
     return qwen3_load_gguf(path);
+}
+
+static Gemma3Model *load_gemma3_auto(const char *path) {
+    printf("[Model] Loading Gemma3 safetensors: %s\n", path);
+    return gemma3_load_safetensors(path);
+}
+
+// Legacy helper: loads Qwen3 model (for backward compat with SFT etc.)
+static Qwen3Model *load_model_auto(const char *path) {
+    return load_qwen3_auto(path);
+}
+
+// ==================================================================
+// LoRA load + merge helper
+// ==================================================================
+
+static void load_and_merge_lora(Qwen3Model *model, Config *cfg) {
+    qwen3_attach_lora(model, cfg->lora_rank, cfg->lora_alpha);
+    qwen3_load_lora(model, cfg->lora_adapter);
+    for (int i = 0; i < model->n_layers; i++) {
+        lora_merge(model->q_loras[i]);
+        lora_merge(model->v_loras[i]);
+    }
 }
 
 // ==================================================================
@@ -268,33 +333,48 @@ static void run_sft(Config *cfg) {
     }
 
     float lr = cfg->lr > 0 ? cfg->lr : 1e-5f;
-    printf("=== Qwen3 Fast LoRA SFT ===\n");
+    ModelType mtype = detect_model_type(cfg->gguf_path);
+    const char *model_name = (mtype == MODEL_GEMMA3) ? "Gemma3" : "Qwen3";
+
+    printf("=== %s Fast LoRA SFT ===\n", model_name);
     printf("  Model: %s\n", cfg->gguf_path);
     printf("  LoRA rank: %d, alpha: %.1f\n", cfg->lora_rank, cfg->lora_alpha);
     printf("  Seq: %d, Steps: %d\n", cfg->seq_len, cfg->max_steps);
     printf("  LR: %.2e\n\n", lr);
 
-    // Load model (auto-detect format)
-    Qwen3Model *model = load_model_auto(cfg->gguf_path);
-    if (!model) {
-        fprintf(stderr, "[SFT] Failed to load model\n");
-        return;
-    }
-    printf("[SFT] Total model params: %zu (%.2f B)\n",
-           qwen3_param_count(model), (float)qwen3_param_count(model) / 1e9f);
+    // Load model and create SFT state (auto-detect model type)
+    SFTState *sft = NULL;
+    Qwen3Model *qmodel = NULL;
+    Gemma3Model *gmodel = NULL;
 
-    // Load existing LoRA adapter if specified
-    if (cfg->lora_adapter[0]) {
-        qwen3_attach_lora(model, cfg->lora_rank, cfg->lora_alpha);
-        qwen3_load_lora(model, cfg->lora_adapter);
+    if (mtype == MODEL_GEMMA3) {
+        gmodel = load_gemma3_auto(cfg->gguf_path);
+        if (!gmodel) { fprintf(stderr, "[SFT] Failed to load model\n"); return; }
+        printf("[SFT] Total model params: %zu (%.2f B)\n",
+               gemma3_param_count(gmodel), (float)gemma3_param_count(gmodel) / 1e9f);
+        if (cfg->lora_adapter[0]) {
+            gemma3_attach_lora(gmodel, cfg->lora_rank, cfg->lora_alpha);
+            gemma3_load_lora(gmodel, cfg->lora_adapter);
+        }
+        sft = sft_state_create_gemma3(gmodel, cfg->seq_len,
+                                       cfg->lora_rank, cfg->lora_alpha);
+    } else {
+        qmodel = load_model_auto(cfg->gguf_path);
+        if (!qmodel) { fprintf(stderr, "[SFT] Failed to load model\n"); return; }
+        printf("[SFT] Total model params: %zu (%.2f B)\n",
+               qwen3_param_count(qmodel), (float)qwen3_param_count(qmodel) / 1e9f);
+        if (cfg->lora_adapter[0]) {
+            qwen3_attach_lora(qmodel, cfg->lora_rank, cfg->lora_alpha);
+            qwen3_load_lora(qmodel, cfg->lora_adapter);
+        }
+        sft = sft_state_create(qmodel, cfg->seq_len,
+                                cfg->lora_rank, cfg->lora_alpha);
     }
 
-    // Create fast SFT state (converts weights to F16, allocates GPU buffers)
-    SFTState *sft = sft_state_create(model, cfg->seq_len,
-                                      cfg->lora_rank, cfg->lora_alpha);
     if (!sft) {
         fprintf(stderr, "[SFT] Failed to create SFT state\n");
-        qwen3_free(model);
+        if (gmodel) gemma3_free(gmodel);
+        if (qmodel) qwen3_free(qmodel);
         return;
     }
 
@@ -318,7 +398,6 @@ static void run_sft(Config *cfg) {
     printf("\n=== Fast SFT Training Start ===\n");
     for (int step = 0; step < cfg->max_steps; step++) {
         if (train_loader) {
-            // Load batch via dataloader (float interface → cast to uint32)
             int tok_shape[] = {BN};
             Tensor *input_f  = tensor_create(tok_shape, 1, DTYPE_FP32, 0);
             Tensor *target_f = tensor_create(tok_shape, 1, DTYPE_FP32, 0);
@@ -335,15 +414,13 @@ static void run_sft(Config *cfg) {
             tensor_free(input_f);
             tensor_free(target_f);
         } else {
-            // Dummy data for testing: fixed repeating tokens
             srand(42);
             for (int i = 0; i < BN; i++) {
-                input_tokens[i]  = (uint32_t)(rand() % 1000);  // small vocab subset
+                input_tokens[i]  = (uint32_t)(rand() % 1000);
                 target_tokens[i] = (i + 1 < BN) ? input_tokens[i + 1] : input_tokens[0];
             }
         }
 
-        // Single GPU call: forward + loss + backward + flush
         float loss = sft_train_step(sft, input_tokens, target_tokens, lr);
 
         if (step % cfg->log_interval == 0) {
@@ -356,16 +433,20 @@ static void run_sft(Config *cfg) {
     }
 
     // Sync LoRA weights back to model for saving
-    sft_sync_lora_to_model(sft, model);
-
-    // Save LoRA adapter
     char lora_path[512];
     if (cfg->lora_adapter[0]) {
         strncpy(lora_path, cfg->lora_adapter, 511);
     } else {
         snprintf(lora_path, sizeof(lora_path), "%s/lora_adapter.bin", cfg->checkpoint_dir);
     }
-    qwen3_save_lora(model, lora_path);
+
+    if (mtype == MODEL_GEMMA3) {
+        sft_sync_lora_to_gemma3(sft, gmodel);
+        gemma3_save_lora(gmodel, lora_path);
+    } else {
+        sft_sync_lora_to_model(sft, qmodel);
+        qwen3_save_lora(qmodel, lora_path);
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &now);
     double total_time = (double)(now.tv_sec - start.tv_sec) +
@@ -379,7 +460,8 @@ static void run_sft(Config *cfg) {
     free(target_tokens);
     sft_state_free(sft);
     if (train_loader) dataloader_free(train_loader);
-    qwen3_free(model);
+    if (gmodel) gemma3_free(gmodel);
+    if (qmodel) qwen3_free(qmodel);
 }
 
 // ==================================================================
@@ -392,25 +474,9 @@ static void run_generate(Config *cfg) {
         return;
     }
 
-    printf("=== Qwen3 Text Generation ===\n");
-
-    Qwen3Model *model = load_model_auto(cfg->gguf_path);
-    if (!model) {
-        fprintf(stderr, "[Generate] Failed to load model\n");
-        return;
-    }
-
-    // Load LoRA adapter if specified
-    if (cfg->lora_adapter[0]) {
-        qwen3_attach_lora(model, cfg->lora_rank, cfg->lora_alpha);
-        qwen3_load_lora(model, cfg->lora_adapter);
-        // Merge LoRA into base weights for faster inference
-        for (int i = 0; i < model->n_layers; i++) {
-            lora_merge(model->q_loras[i]);
-            lora_merge(model->v_loras[i]);
-        }
-        printf("[Generate] LoRA merged into base weights\n");
-    }
+    ModelType mtype = detect_model_type(cfg->gguf_path);
+    printf("=== %s Text Generation ===\n",
+           mtype == MODEL_GEMMA3 ? "Gemma3" : "Qwen3");
 
     // Load prompt tokens
     int prompt_len = 0;
@@ -418,11 +484,9 @@ static void run_generate(Config *cfg) {
     uint32_t *tokens = NULL;
 
     if (cfg->token_file[0]) {
-        // Load pre-tokenized prompt from binary file
         FILE *tf = fopen(cfg->token_file, "rb");
         if (!tf) {
             fprintf(stderr, "[Generate] Cannot open token file: %s\n", cfg->token_file);
-            qwen3_free(model);
             return;
         }
         fseek(tf, 0, SEEK_END);
@@ -439,7 +503,6 @@ static void run_generate(Config *cfg) {
         for (int i = 0; i < prompt_len; i++) printf("%u ", tokens[i]);
         printf("\n");
     } else {
-        // Byte-level fallback for quick testing
         const char *prompt = cfg->prompt[0] ? cfg->prompt : "Hello";
         prompt_len = (int)strlen(prompt);
         max_len = prompt_len + cfg->max_gen_len;
@@ -452,22 +515,59 @@ static void run_generate(Config *cfg) {
     }
     printf("Generating up to %d tokens...\n", cfg->max_gen_len);
 
-    // Fast inference with pre-allocated buffers + KV cache + Accelerate BLAS
     uint32_t *gen_tokens = calloc(cfg->max_gen_len, sizeof(uint32_t));
     int n_generated;
-    if (cfg->gen_batch > 1) {
-        printf("[Generate] Batched generation: batch=%d, F16\n", cfg->gen_batch);
-        free(gen_tokens);
-        gen_tokens = calloc((size_t)cfg->gen_batch * cfg->max_gen_len, sizeof(uint32_t));
-        n_generated = qwen3_generate_fast_batch(model, tokens, prompt_len,
-                                                 gen_tokens, cfg->max_gen_len, max_len,
-                                                 cfg->gen_batch);
-    } else {
+
+    if (mtype == MODEL_GEMMA3) {
+        // Gemma3 path
+        Gemma3Model *model = load_gemma3_auto(cfg->gguf_path);
+        if (!model) {
+            fprintf(stderr, "[Generate] Failed to load Gemma3 model\n");
+            free(tokens); free(gen_tokens);
+            return;
+        }
+
         if (cfg->use_fp16)
             printf("[Generate] Using F16 precision (no quantization)\n");
-        n_generated = qwen3_generate_fast(model, tokens, prompt_len,
-                                          gen_tokens, cfg->max_gen_len, max_len,
-                                          cfg->use_fp16);
+
+        InferenceState *state = inference_state_create_gemma3(model, max_len, cfg->use_fp16);
+        if (!state) {
+            gemma3_free(model); free(tokens); free(gen_tokens);
+            return;
+        }
+        n_generated = inference_generate(state, tokens, prompt_len,
+                                          gen_tokens, cfg->max_gen_len);
+        inference_state_free(state);
+        gemma3_free(model);
+    } else {
+        // Qwen3 path
+        Qwen3Model *model = load_qwen3_auto(cfg->gguf_path);
+        if (!model) {
+            fprintf(stderr, "[Generate] Failed to load model\n");
+            free(tokens); free(gen_tokens);
+            return;
+        }
+
+        if (cfg->lora_adapter[0]) {
+            load_and_merge_lora(model, cfg);
+            printf("[Generate] LoRA merged into base weights\n");
+        }
+
+        if (cfg->gen_batch > 1) {
+            printf("[Generate] Batched generation: batch=%d, F16\n", cfg->gen_batch);
+            free(gen_tokens);
+            gen_tokens = calloc((size_t)cfg->gen_batch * cfg->max_gen_len, sizeof(uint32_t));
+            n_generated = qwen3_generate_fast_batch(model, tokens, prompt_len,
+                                                     gen_tokens, cfg->max_gen_len, max_len,
+                                                     cfg->gen_batch);
+        } else {
+            if (cfg->use_fp16)
+                printf("[Generate] Using F16 precision (no quantization)\n");
+            n_generated = qwen3_generate_fast(model, tokens, prompt_len,
+                                              gen_tokens, cfg->max_gen_len, max_len,
+                                              cfg->use_fp16);
+        }
+        qwen3_free(model);
     }
 
     // Copy generated tokens to the full sequence
@@ -492,7 +592,6 @@ static void run_generate(Config *cfg) {
     }
 
     free(tokens);
-    qwen3_free(model);
 }
 
 // ==================================================================
@@ -505,41 +604,41 @@ static void run_serve(Config *cfg) {
         return;
     }
 
-    fprintf(stderr, "[Serve] Loading model: %s\n", cfg->gguf_path);
-    Qwen3Model *model = load_model_auto(cfg->gguf_path);
-    if (!model) {
-        fprintf(stderr, "[Serve] Failed to load model\n");
-        return;
-    }
+    ModelType mtype = detect_model_type(cfg->gguf_path);
+    fprintf(stderr, "[Serve] Loading model (%s): %s\n",
+            mtype == MODEL_GEMMA3 ? "gemma3" : "qwen3", cfg->gguf_path);
 
-    // Load LoRA adapter if specified
-    if (cfg->lora_adapter[0]) {
-        qwen3_attach_lora(model, cfg->lora_rank, cfg->lora_alpha);
-        qwen3_load_lora(model, cfg->lora_adapter);
-        for (int i = 0; i < model->n_layers; i++) {
-            lora_merge(model->q_loras[i]);
-            lora_merge(model->v_loras[i]);
-        }
-        fprintf(stderr, "[Serve] LoRA merged into base weights\n");
-    }
+    InferenceState *state = NULL;
+    void *model_ptr = NULL;  // keep alive for token_emb pointer
 
     int max_seq_len = cfg->max_gen_len + 512;
     if (max_seq_len > 4096) max_seq_len = 4096;
 
-    InferenceState *state = inference_state_create(model, max_seq_len, cfg->use_fp16);
+    if (mtype == MODEL_GEMMA3) {
+        Gemma3Model *model = load_gemma3_auto(cfg->gguf_path);
+        if (!model) { fprintf(stderr, "[Serve] Failed to load model\n"); return; }
+        state = inference_state_create_gemma3(model, max_seq_len, cfg->use_fp16);
+        model_ptr = model;
+    } else {
+        Qwen3Model *model = load_qwen3_auto(cfg->gguf_path);
+        if (!model) { fprintf(stderr, "[Serve] Failed to load model\n"); return; }
+        if (cfg->lora_adapter[0]) {
+            load_and_merge_lora(model, cfg);
+            fprintf(stderr, "[Serve] LoRA merged into base weights\n");
+        }
+        state = inference_state_create(model, max_seq_len, cfg->use_fp16);
+        model_ptr = model;
+    }
+
     if (!state) {
         fprintf(stderr, "[Serve] Failed to create inference state\n");
-        qwen3_free(model);
+        if (mtype == MODEL_GEMMA3) gemma3_free(model_ptr);
+        else qwen3_free(model_ptr);
         return;
     }
 
     fprintf(stderr, "[Serve] Ready. Waiting for requests on stdin...\n");
     fflush(stderr);
-
-    // Binary protocol (little-endian uint32):
-    //   Request:  [prompt_len] [max_gen_len] [prompt_len × token_ids]
-    //   Response: [n_generated] [n_generated × token_ids]
-    //   prompt_len == 0 → shutdown
 
     uint32_t *prompt_buf = NULL;
     size_t prompt_cap = 0;
@@ -557,7 +656,6 @@ static void run_serve(Config *cfg) {
             break;
         }
 
-        // Grow prompt buffer if needed
         if (prompt_len > prompt_cap) {
             prompt_cap = prompt_len;
             prompt_buf = realloc(prompt_buf, prompt_cap * sizeof(uint32_t));
@@ -575,7 +673,6 @@ static void run_serve(Config *cfg) {
         int n_gen = inference_generate(state, prompt_buf, (int)prompt_len,
                                         output_buf, (int)max_gen);
 
-        // Write response
         uint32_t n = (uint32_t)n_gen;
         fwrite(&n, sizeof(uint32_t), 1, stdout);
         fwrite(output_buf, sizeof(uint32_t), n_gen, stdout);
@@ -587,7 +684,8 @@ static void run_serve(Config *cfg) {
     free(prompt_buf);
     free(output_buf);
     inference_state_free(state);
-    qwen3_free(model);
+    if (mtype == MODEL_GEMMA3) gemma3_free(model_ptr);
+    else qwen3_free(model_ptr);
 }
 
 // ==================================================================

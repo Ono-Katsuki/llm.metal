@@ -1,23 +1,11 @@
 #include "fast_sft.h"
 #include "fast_metal.h"
+#include "wmat.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 #include <time.h>
-
-// ================================================================
-// Types
-// ================================================================
-
-typedef struct { MetalBuf *mbuf; int rows, cols; } WMat;
-
-typedef struct {
-    WMat *q_proj, *k_proj, *v_proj, *o_proj;
-    WMat *gate_proj, *up_proj, *down_proj;
-    MetalBuf *input_norm_g, *post_attn_norm_g;
-    MetalBuf *q_norm_g, *k_norm_g;
-} LayerW;
 
 typedef struct {
     MetalBuf *A_q, *B_q, *A_v, *B_v;       // weights on GPU (float)
@@ -36,12 +24,17 @@ typedef struct {
     MetalBuf *x_mid, *ln2_out;
     MetalBuf *gate_pre, *up_val;
     MetalBuf *lora_q_mid, *lora_v_mid;
+    MetalBuf *o_proj_out;     // Gemma3: post_attn_norm backward input
+    MetalBuf *ff_raw_out;     // Gemma3: post_ff_norm backward input
 } LayerSave;
 
 struct SFTState {
     int D, Hq, Hkv, hd, IS, V, NL, N;
     int group_ratio;
-    float rope_theta, eps, lora_scaling;
+    float *rope_thetas;       // per-layer rope theta
+    float eps, lora_scaling;
+    float emb_scale;          // Gemma3: sqrt(d_model), Qwen3: 1.0
+    ModelType model_type;
     int lora_rank;
     int step_count;
 
@@ -76,160 +69,59 @@ struct SFTState {
 // Helpers
 // ================================================================
 
-static WMat *wmat_f16(const float *src, int rows, int cols) {
-    WMat *w = calloc(1, sizeof(WMat));
-    w->rows = rows; w->cols = cols;
-    size_t n = (size_t)rows * cols;
-    __fp16 *data = malloc(n * sizeof(__fp16));
-    for (size_t i = 0; i < n; i++) data[i] = (__fp16)src[i];
-    w->mbuf = metal_buf_from_data(data, n * sizeof(__fp16));
-    free(data);
-    return w;
-}
-
-static void wmat_free(WMat *w) {
-    if (!w) return;
-    metal_buf_free(w->mbuf); free(w);
-}
-
 static MetalBuf *mbuf_f(int n) { return metal_buf_create((size_t)n * 4); }
 static MetalBuf *mbuf_data(const float *d, int n) {
     return metal_buf_from_data(d, (size_t)n * 4);
 }
 
-// ================================================================
-// State creation
-// ================================================================
+// Initialize LoRA weights and AdamW state for one layer
+static void init_lora_layer(LoRAW *lr, int R, int D, int Hq_hd, int Hkv_hd,
+                             LoRALinear **q_loras, LoRALinear **v_loras, int i) {
+    int Aq_n = R * D, Bq_n = Hq_hd * R;
+    int Av_n = R * D, Bv_n = Hkv_hd * R;
+    lr->Aq_size = Aq_n; lr->Bq_size = Bq_n;
+    lr->Av_size = Av_n; lr->Bv_size = Bv_n;
 
-SFTState *sft_state_create(Qwen3Model *model, int seq_len,
-                           int lora_rank, float lora_alpha) {
-    if (fast_metal_init() != 0) {
-        fprintf(stderr, "[FastSFT] Metal init failed\n");
-        return NULL;
+    if (q_loras && q_loras[i]) {
+        lr->A_q = mbuf_data(q_loras[i]->lora_A->data, Aq_n);
+        lr->B_q = mbuf_data(q_loras[i]->lora_B->data, Bq_n);
+    } else {
+        float *tmp = malloc(Aq_n * sizeof(float));
+        float std_a = 1.0f / sqrtf((float)D);
+        for (int j = 0; j < Aq_n; j++)
+            tmp[j] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * std_a;
+        lr->A_q = mbuf_data(tmp, Aq_n);
+        free(tmp);
+        tmp = calloc(Bq_n, sizeof(float));
+        lr->B_q = mbuf_data(tmp, Bq_n);
+        free(tmp);
     }
-
-    SFTState *s = calloc(1, sizeof(SFTState));
-    s->D = model->d_model;
-    s->Hq = model->n_q_heads;
-    s->Hkv = model->n_kv_heads;
-    s->hd = model->head_dim;
-    s->IS = model->intermediate_size;
-    s->V = model->vocab_size;
-    s->NL = model->n_layers;
-    s->N = seq_len;
-    s->group_ratio = s->Hq / s->Hkv;
-    s->rope_theta = model->rope_theta;
-    s->eps = 1e-6f;
-    s->lora_rank = lora_rank;
-    s->lora_scaling = lora_alpha / (float)lora_rank;
-    s->step_count = 0;
-
-    int BN = seq_len;
-    int Hq_hd = s->Hq * s->hd;
-    int Hkv_hd = s->Hkv * s->hd;
-    int Hq_ND = s->Hq * BN * s->hd;
-    int Hkv_ND = s->Hkv * BN * s->hd;
-    int R = lora_rank;
-
-    printf("[FastSFT] Converting weights to F16...\n");
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
-    // Convert frozen weights to F16
-    s->layers = calloc(s->NL, sizeof(LayerW));
-    for (int i = 0; i < s->NL; i++) {
-        Qwen3Block *blk = model->blocks[i];
-        LayerW *lw = &s->layers[i];
-        lw->q_proj = wmat_f16(blk->attn->q_proj->weight->data, Hq_hd, s->D);
-        lw->k_proj = wmat_f16(blk->attn->k_proj->weight->data, Hkv_hd, s->D);
-        lw->v_proj = wmat_f16(blk->attn->v_proj->weight->data, Hkv_hd, s->D);
-        lw->o_proj = wmat_f16(blk->attn->o_proj->weight->data, s->D, Hq_hd);
-        lw->gate_proj = wmat_f16(blk->gate_proj->weight->data, s->IS, s->D);
-        lw->up_proj = wmat_f16(blk->up_proj->weight->data, s->IS, s->D);
-        lw->down_proj = wmat_f16(blk->down_proj->weight->data, s->D, s->IS);
-        lw->input_norm_g = mbuf_data(blk->input_norm->gamma->data, s->D);
-        lw->post_attn_norm_g = mbuf_data(blk->post_attn_norm->gamma->data, s->D);
-        lw->q_norm_g = mbuf_data(blk->attn->q_norm->gamma->data, s->hd);
-        lw->k_norm_g = mbuf_data(blk->attn->k_norm->gamma->data, s->hd);
-        if ((i + 1) % 6 == 0)
-            printf("[FastSFT]   Converted layers 0-%d\n", i);
+    if (v_loras && v_loras[i]) {
+        lr->A_v = mbuf_data(v_loras[i]->lora_A->data, Av_n);
+        lr->B_v = mbuf_data(v_loras[i]->lora_B->data, Bv_n);
+    } else {
+        float *tmp = malloc(Av_n * sizeof(float));
+        float std_a = 1.0f / sqrtf((float)D);
+        for (int j = 0; j < Av_n; j++)
+            tmp[j] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * std_a;
+        lr->A_v = mbuf_data(tmp, Av_n);
+        free(tmp);
+        tmp = calloc(Bv_n, sizeof(float));
+        lr->B_v = mbuf_data(tmp, Bv_n);
+        free(tmp);
     }
-    s->lm_head = wmat_f16(model->lm_head->weight->data, s->V, s->D);
-    s->final_norm_g = mbuf_data(model->final_norm->gamma->data, s->D);
-    s->token_emb = model->token_emb->weight->data;
+    lr->dA_q = mbuf_f(Aq_n); lr->dB_q = mbuf_f(Bq_n);
+    lr->dA_v = mbuf_f(Av_n); lr->dB_v = mbuf_f(Bv_n);
 
-    // Initialize LoRA weights on GPU
-    s->lora = calloc(s->NL, sizeof(LoRAW));
-    for (int i = 0; i < s->NL; i++) {
-        LoRAW *lr = &s->lora[i];
-        int Aq_n = R * s->D, Bq_n = Hq_hd * R;
-        int Av_n = R * s->D, Bv_n = Hkv_hd * R;
-        lr->Aq_size = Aq_n; lr->Bq_size = Bq_n;
-        lr->Av_size = Av_n; lr->Bv_size = Bv_n;
+    lr->m_Aq = calloc(Aq_n, sizeof(float)); lr->v_Aq = calloc(Aq_n, sizeof(float));
+    lr->m_Bq = calloc(Bq_n, sizeof(float)); lr->v_Bq = calloc(Bq_n, sizeof(float));
+    lr->m_Av = calloc(Av_n, sizeof(float)); lr->v_Av = calloc(Av_n, sizeof(float));
+    lr->m_Bv = calloc(Bv_n, sizeof(float)); lr->v_Bv = calloc(Bv_n, sizeof(float));
+}
 
-        // Copy from model if LoRA already attached, else init
-        if (model->q_loras && model->q_loras[i]) {
-            lr->A_q = mbuf_data(model->q_loras[i]->lora_A->data, Aq_n);
-            lr->B_q = mbuf_data(model->q_loras[i]->lora_B->data, Bq_n);
-        } else {
-            // Kaiming init for A, zero init for B
-            float *tmp = malloc(Aq_n * sizeof(float));
-            float std_a = 1.0f / sqrtf((float)s->D);
-            for (int j = 0; j < Aq_n; j++)
-                tmp[j] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * std_a;
-            lr->A_q = mbuf_data(tmp, Aq_n);
-            free(tmp);
-            tmp = calloc(Bq_n, sizeof(float));
-            lr->B_q = mbuf_data(tmp, Bq_n);
-            free(tmp);
-        }
-        if (model->v_loras && model->v_loras[i]) {
-            lr->A_v = mbuf_data(model->v_loras[i]->lora_A->data, Av_n);
-            lr->B_v = mbuf_data(model->v_loras[i]->lora_B->data, Bv_n);
-        } else {
-            float *tmp = malloc(Av_n * sizeof(float));
-            float std_a = 1.0f / sqrtf((float)s->D);
-            for (int j = 0; j < Av_n; j++)
-                tmp[j] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f * std_a;
-            lr->A_v = mbuf_data(tmp, Av_n);
-            free(tmp);
-            tmp = calloc(Bv_n, sizeof(float));
-            lr->B_v = mbuf_data(tmp, Bv_n);
-            free(tmp);
-        }
-        lr->dA_q = mbuf_f(Aq_n); lr->dB_q = mbuf_f(Bq_n);
-        lr->dA_v = mbuf_f(Av_n); lr->dB_v = mbuf_f(Bv_n);
-
-        // AdamW state
-        lr->m_Aq = calloc(Aq_n, sizeof(float)); lr->v_Aq = calloc(Aq_n, sizeof(float));
-        lr->m_Bq = calloc(Bq_n, sizeof(float)); lr->v_Bq = calloc(Bq_n, sizeof(float));
-        lr->m_Av = calloc(Av_n, sizeof(float)); lr->v_Av = calloc(Av_n, sizeof(float));
-        lr->m_Bv = calloc(Bv_n, sizeof(float)); lr->v_Bv = calloc(Bv_n, sizeof(float));
-    }
-
-    // Allocate saved activations per layer
-    s->saves = calloc(s->NL, sizeof(LayerSave));
-    for (int i = 0; i < s->NL; i++) {
-        LayerSave *sv = &s->saves[i];
-        sv->x_in = mbuf_f(BN * s->D);
-        sv->ln1_out = mbuf_f(BN * s->D);
-        sv->q_pre_norm = mbuf_f(Hq_ND);
-        sv->k_pre_norm = mbuf_f(Hkv_ND);
-        sv->q_final = mbuf_f(Hq_ND);
-        sv->k_exp = mbuf_f(Hq_ND);
-        sv->v_exp = mbuf_f(Hq_ND);
-        sv->probs = mbuf_f(s->Hq * BN * BN);
-        sv->x_mid = mbuf_f(BN * s->D);
-        sv->ln2_out = mbuf_f(BN * s->D);
-        sv->gate_pre = mbuf_f(BN * s->IS);
-        sv->up_val = mbuf_f(BN * s->IS);
-        sv->lora_q_mid = mbuf_f(BN * R);
-        sv->lora_v_mid = mbuf_f(BN * R);
-    }
-    s->save_x_final = mbuf_f(BN * s->D);
-    s->save_ln_final = mbuf_f(BN * s->D);
-
-    // Forward scratch
+// Allocate scratch buffers shared between Qwen3 and Gemma3
+static void alloc_scratch_buffers(SFTState *s, int BN, int Hq_hd, int Hkv_hd,
+                                   int Hq_ND, int Hkv_ND, int R) {
     s->mb_x = metal_buf_create(BN * s->D * sizeof(float));
     s->x_cpu = (float *)metal_buf_ptr(s->mb_x);
     s->mb_ln = mbuf_f(BN * s->D);
@@ -249,22 +141,238 @@ SFTState *sft_state_create(Qwen3Model *model, int seq_len,
     s->mb_ff = mbuf_f(BN * s->D);
     s->mb_logits = metal_buf_create((size_t)BN * s->V * sizeof(float));
     s->mb_lora_tmp = mbuf_f(BN * R);
-    s->mb_lora_out = mbuf_f(BN * Hq_hd); // max(Hq*hd, Hkv*hd)
+    s->mb_lora_out = mbuf_f(BN * Hq_hd);
 
-    // Loss
     s->mb_targets = metal_buf_create(BN * sizeof(uint32_t));
     s->mb_losses = metal_buf_create(BN * sizeof(float));
     s->losses_cpu = (float *)metal_buf_ptr(s->mb_losses);
     s->mb_dlogits = metal_buf_create((size_t)BN * s->V * sizeof(float));
 
-    // Backward scratch
     s->mb_dx = mbuf_f(BN * s->D);
     s->mb_dx2 = mbuf_f(BN * s->D);
     s->mb_d_score = mbuf_f(s->Hq * BN * BN);
+}
+
+// ================================================================
+// State creation — Qwen3
+// ================================================================
+
+SFTState *sft_state_create(Qwen3Model *model, int seq_len,
+                           int lora_rank, float lora_alpha) {
+    if (fast_metal_init() != 0) {
+        fprintf(stderr, "[FastSFT] Metal init failed\n");
+        return NULL;
+    }
+
+    SFTState *s = calloc(1, sizeof(SFTState));
+    s->model_type = MODEL_QWEN3;
+    s->D = model->d_model;
+    s->Hq = model->n_q_heads;
+    s->Hkv = model->n_kv_heads;
+    s->hd = model->head_dim;
+    s->IS = model->intermediate_size;
+    s->V = model->vocab_size;
+    s->NL = model->n_layers;
+    s->N = seq_len;
+    s->group_ratio = s->Hq / s->Hkv;
+    s->emb_scale = 1.0f;
+    s->eps = 1e-6f;
+    s->lora_rank = lora_rank;
+    s->lora_scaling = lora_alpha / (float)lora_rank;
+    s->step_count = 0;
+
+    // Per-layer rope thetas (all same for Qwen3)
+    s->rope_thetas = malloc(s->NL * sizeof(float));
+    for (int i = 0; i < s->NL; i++)
+        s->rope_thetas[i] = model->rope_theta;
+
+    int BN = seq_len;
+    int Hq_hd = s->Hq * s->hd;
+    int Hkv_hd = s->Hkv * s->hd;
+    int Hq_ND = s->Hq * BN * s->hd;
+    int Hkv_ND = s->Hkv * BN * s->hd;
+    int R = lora_rank;
+
+    printf("[FastSFT] Converting weights to F16...\n");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    // Build LayerWeightRef array from Qwen3Model
+    LayerWeightRef *refs = calloc(s->NL, sizeof(LayerWeightRef));
+    for (int i = 0; i < s->NL; i++) {
+        Qwen3Block *blk = model->blocks[i];
+        LayerWeightRef *r = &refs[i];
+        r->q_proj = (WeightRef){ blk->attn->q_proj->weight->data, Hq_hd, s->D };
+        r->k_proj = (WeightRef){ blk->attn->k_proj->weight->data, Hkv_hd, s->D };
+        r->v_proj = (WeightRef){ blk->attn->v_proj->weight->data, Hkv_hd, s->D };
+        r->o_proj = (WeightRef){ blk->attn->o_proj->weight->data, s->D, Hq_hd };
+        r->gate_proj = (WeightRef){ blk->gate_proj->weight->data, s->IS, s->D };
+        r->up_proj = (WeightRef){ blk->up_proj->weight->data, s->IS, s->D };
+        r->down_proj = (WeightRef){ blk->down_proj->weight->data, s->D, s->IS };
+        r->input_norm_g = blk->input_norm->gamma->data;
+        r->post_attn_norm_g = blk->post_attn_norm->gamma->data;
+        r->q_norm_g = blk->attn->q_norm->gamma->data;
+        r->k_norm_g = blk->attn->k_norm->gamma->data;
+        r->d_model = s->D;
+        r->head_dim = s->hd;
+    }
+
+    s->layers = layers_convert_upload(refs, s->NL, 1);
+    free(refs);
+    s->lm_head = wmat_convert(model->lm_head->weight->data, model->vocab_size, model->d_model, 1);
+    s->final_norm_g = norm_upload(model->final_norm->gamma->data, model->d_model);
+    s->token_emb = model->token_emb->weight->data;
+
+    // Initialize LoRA
+    s->lora = calloc(s->NL, sizeof(LoRAW));
+    for (int i = 0; i < s->NL; i++)
+        init_lora_layer(&s->lora[i], R, s->D, Hq_hd, Hkv_hd,
+                        model->q_loras, model->v_loras, i);
+
+    // Allocate saved activations per layer
+    s->saves = calloc(s->NL, sizeof(LayerSave));
+    for (int i = 0; i < s->NL; i++) {
+        LayerSave *sv = &s->saves[i];
+        sv->x_in = mbuf_f(BN * s->D);
+        sv->ln1_out = mbuf_f(BN * s->D);
+        sv->q_pre_norm = mbuf_f(Hq_ND);
+        sv->k_pre_norm = mbuf_f(Hkv_ND);
+        sv->q_final = mbuf_f(Hq_ND);
+        sv->k_exp = mbuf_f(Hq_ND);
+        sv->v_exp = mbuf_f(Hq_ND);
+        sv->probs = mbuf_f(s->Hq * BN * BN);
+        sv->x_mid = mbuf_f(BN * s->D);
+        sv->ln2_out = mbuf_f(BN * s->D);
+        sv->gate_pre = mbuf_f(BN * s->IS);
+        sv->up_val = mbuf_f(BN * s->IS);
+        sv->lora_q_mid = mbuf_f(BN * R);
+        sv->lora_v_mid = mbuf_f(BN * R);
+        // Qwen3: not needed
+        sv->o_proj_out = NULL;
+        sv->ff_raw_out = NULL;
+    }
+    s->save_x_final = mbuf_f(BN * s->D);
+    s->save_ln_final = mbuf_f(BN * s->D);
+
+    alloc_scratch_buffers(s, BN, Hq_hd, Hkv_hd, Hq_ND, Hkv_ND, R);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     printf("[FastSFT] Init: %.0f ms, seq=%d, lora_rank=%d\n", ms, seq_len, lora_rank);
+    return s;
+}
+
+// ================================================================
+// State creation — Gemma3
+// ================================================================
+
+SFTState *sft_state_create_gemma3(Gemma3Model *model, int seq_len,
+                                   int lora_rank, float lora_alpha) {
+    if (fast_metal_init() != 0) {
+        fprintf(stderr, "[FastSFT] Metal init failed\n");
+        return NULL;
+    }
+
+    SFTState *s = calloc(1, sizeof(SFTState));
+    s->model_type = MODEL_GEMMA3;
+    s->D = model->d_model;
+    s->Hq = model->n_q_heads;
+    s->Hkv = model->n_kv_heads;
+    s->hd = model->head_dim;
+    s->IS = model->intermediate_size;
+    s->V = model->vocab_size;
+    s->NL = model->n_layers;
+    s->N = seq_len;
+    s->group_ratio = s->Hq / s->Hkv;
+    s->emb_scale = sqrtf((float)model->d_model);
+    s->eps = 1e-6f;
+    s->lora_rank = lora_rank;
+    s->lora_scaling = lora_alpha / (float)lora_rank;
+    s->step_count = 0;
+
+    // Per-layer rope thetas (local vs global)
+    s->rope_thetas = malloc(s->NL * sizeof(float));
+    for (int i = 0; i < s->NL; i++) {
+        int is_sliding = (i % 6) != 0;
+        s->rope_thetas[i] = is_sliding ? model->local_rope_theta : model->global_rope_theta;
+    }
+
+    int BN = seq_len;
+    int Hq_hd = s->Hq * s->hd;
+    int Hkv_hd = s->Hkv * s->hd;
+    int Hq_ND = s->Hq * BN * s->hd;
+    int Hkv_ND = s->Hkv * BN * s->hd;
+    int R = lora_rank;
+
+    printf("[FastSFT] Converting Gemma3 weights to F16...\n");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    // Build LayerWeightRef array from Gemma3Model
+    LayerWeightRef *refs = calloc(s->NL, sizeof(LayerWeightRef));
+    for (int i = 0; i < s->NL; i++) {
+        Gemma3Block *blk = model->blocks[i];
+        LayerWeightRef *r = &refs[i];
+        r->q_proj = (WeightRef){ blk->attn->q_proj->weight->data, Hq_hd, s->D };
+        r->k_proj = (WeightRef){ blk->attn->k_proj->weight->data, Hkv_hd, s->D };
+        r->v_proj = (WeightRef){ blk->attn->v_proj->weight->data, Hkv_hd, s->D };
+        r->o_proj = (WeightRef){ blk->attn->o_proj->weight->data, s->D, Hq_hd };
+        r->gate_proj = (WeightRef){ blk->gate_proj->weight->data, s->IS, s->D };
+        r->up_proj = (WeightRef){ blk->up_proj->weight->data, s->IS, s->D };
+        r->down_proj = (WeightRef){ blk->down_proj->weight->data, s->D, s->IS };
+        r->input_norm_g = blk->input_norm->gamma->data;
+        r->post_attn_norm_g = blk->post_attn_norm->gamma->data;
+        r->pre_ff_norm_g = blk->pre_ff_norm->gamma->data;
+        r->post_ff_norm_g = blk->post_ff_norm->gamma->data;
+        r->q_norm_g = blk->attn->q_norm->gamma->data;
+        r->k_norm_g = blk->attn->k_norm->gamma->data;
+        r->d_model = s->D;
+        r->head_dim = s->hd;
+    }
+
+    s->layers = layers_convert_upload(refs, s->NL, 1);
+    free(refs);
+    // Gemma3: lm_head is tied with token_emb
+    s->lm_head = wmat_convert(model->token_emb->weight->data, model->vocab_size, model->d_model, 1);
+    s->final_norm_g = norm_upload(model->final_norm->gamma->data, model->d_model);
+    s->token_emb = model->token_emb->weight->data;
+
+    // Initialize LoRA
+    s->lora = calloc(s->NL, sizeof(LoRAW));
+    for (int i = 0; i < s->NL; i++)
+        init_lora_layer(&s->lora[i], R, s->D, Hq_hd, Hkv_hd,
+                        model->q_loras, model->v_loras, i);
+
+    // Allocate saved activations per layer
+    s->saves = calloc(s->NL, sizeof(LayerSave));
+    for (int i = 0; i < s->NL; i++) {
+        LayerSave *sv = &s->saves[i];
+        sv->x_in = mbuf_f(BN * s->D);
+        sv->ln1_out = mbuf_f(BN * s->D);
+        sv->q_pre_norm = mbuf_f(Hq_ND);
+        sv->k_pre_norm = mbuf_f(Hkv_ND);
+        sv->q_final = mbuf_f(Hq_ND);
+        sv->k_exp = mbuf_f(Hq_ND);
+        sv->v_exp = mbuf_f(Hq_ND);
+        sv->probs = mbuf_f(s->Hq * BN * BN);
+        sv->x_mid = mbuf_f(BN * s->D);
+        sv->ln2_out = mbuf_f(BN * s->D);
+        sv->gate_pre = mbuf_f(BN * s->IS);
+        sv->up_val = mbuf_f(BN * s->IS);
+        sv->lora_q_mid = mbuf_f(BN * R);
+        sv->lora_v_mid = mbuf_f(BN * R);
+        // Gemma3: extra saved activations for 4-norm structure
+        sv->o_proj_out = mbuf_f(BN * s->D);
+        sv->ff_raw_out = mbuf_f(BN * s->D);
+    }
+    s->save_x_final = mbuf_f(BN * s->D);
+    s->save_ln_final = mbuf_f(BN * s->D);
+
+    alloc_scratch_buffers(s, BN, Hq_hd, Hkv_hd, Hq_ND, Hkv_ND, R);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    printf("[FastSFT] Gemma3 Init: %.0f ms, seq=%d, lora_rank=%d\n", ms, seq_len, lora_rank);
     return s;
 }
 
@@ -278,6 +386,7 @@ static void sft_forward(SFTState *s) {
     int Hq_hd = Hq * hd, Hkv_hd = Hkv * hd;
     float eps = s->eps, sc = s->lora_scaling;
     float attn_scale = 1.0f / sqrtf((float)hd);
+    int is_gemma3 = (s->model_type == MODEL_GEMMA3);
 
     for (int L = 0; L < s->NL; L++) {
         LayerW *lw = &s->layers[L];
@@ -291,9 +400,8 @@ static void sft_forward(SFTState *s) {
         metal_enqueue_rms_norm_batched(s->mb_x, lw->input_norm_g, s->mb_ln, D, eps, BN);
         metal_enqueue_copy(s->mb_ln, sv->ln1_out, BN * D);
 
-        // Q projection: q = ln @ W_q^T
+        // Q projection + LoRA Q
         metal_enqueue_f16_matmul(s->mb_ln, lw->q_proj->mbuf, s->mb_q, BN, Hq_hd, D);
-        // LoRA Q: q += sc * ln @ A_q^T @ B_q^T
         metal_enqueue_float_matmul(s->mb_ln, lr->A_q, s->mb_lora_tmp, BN, R, D);
         metal_enqueue_copy(s->mb_lora_tmp, sv->lora_q_mid, BN * R);
         metal_enqueue_float_matmul(s->mb_lora_tmp, lr->B_q, s->mb_lora_out, BN, Hq_hd, R);
@@ -318,17 +426,17 @@ static void sft_forward(SFTState *s) {
         metal_enqueue_copy(s->mb_q_t, sv->q_pre_norm, Hq * BN * hd);
         metal_enqueue_copy(s->mb_k_t, sv->k_pre_norm, Hkv * BN * hd);
 
-        // QK norm (in-place, treating [H, N, D] as batch of H*N vectors of dim D)
+        // QK norm
         metal_enqueue_rms_norm_batched(s->mb_q_t, lw->q_norm_g, s->mb_q_t, hd, eps, Hq * BN);
         metal_enqueue_rms_norm_batched(s->mb_k_t, lw->k_norm_g, s->mb_k_t, hd, eps, Hkv * BN);
 
-        // RoPE (in-place)
-        metal_enqueue_rope_train(s->mb_q_t, s->mb_k_t, Hq, Hkv, hd, BN, s->rope_theta);
+        // RoPE (per-layer theta)
+        metal_enqueue_rope_train(s->mb_q_t, s->mb_k_t, Hq, Hkv, hd, BN, s->rope_thetas[L]);
 
         // Save Q after norm+RoPE
         metal_enqueue_copy(s->mb_q_t, sv->q_final, Hq * BN * hd);
 
-        // Repeat KV: [Hkv, N, D] -> [Hq, N, D]
+        // Repeat KV
         metal_enqueue_repeat_kv(s->mb_k_t, s->mb_k_exp, Hkv, BN, hd, s->group_ratio);
         metal_enqueue_repeat_kv(s->mb_v_t, s->mb_v_exp, Hkv, BN, hd, s->group_ratio);
         metal_enqueue_copy(s->mb_k_exp, sv->k_exp, Hq * BN * hd);
@@ -345,26 +453,45 @@ static void sft_forward(SFTState *s) {
         // O projection
         metal_enqueue_f16_matmul(s->mb_attn_flat, lw->o_proj->mbuf, s->mb_x2, BN, D, Hq_hd);
 
-        // Residual add
-        metal_enqueue_residual_add(s->mb_x, s->mb_x2, BN * D);
+        if (is_gemma3) {
+            // Gemma3: o_proj → post_attn_norm → residual_add → pre_ff_norm → FFN
+            metal_enqueue_copy(s->mb_x2, sv->o_proj_out, BN * D);
+            metal_enqueue_rms_norm_batched(s->mb_x2, lw->post_attn_norm_g, s->mb_x2, D, eps, BN);
+            metal_enqueue_residual_add(s->mb_x, s->mb_x2, BN * D);
+            metal_enqueue_copy(s->mb_x, sv->x_mid, BN * D);
+            metal_enqueue_rms_norm_batched(s->mb_x, lw->pre_ff_norm_g, s->mb_ln, D, eps, BN);
+            metal_enqueue_copy(s->mb_ln, sv->ln2_out, BN * D);
+        } else {
+            // Qwen3: o_proj → residual_add → post_attn_norm → FFN
+            metal_enqueue_residual_add(s->mb_x, s->mb_x2, BN * D);
+            metal_enqueue_copy(s->mb_x, sv->x_mid, BN * D);
+            metal_enqueue_rms_norm_batched(s->mb_x, lw->post_attn_norm_g, s->mb_ln, D, eps, BN);
+            metal_enqueue_copy(s->mb_ln, sv->ln2_out, BN * D);
+        }
 
-        // Save x_mid (after attention residual)
-        metal_enqueue_copy(s->mb_x, sv->x_mid, BN * D);
-
-        // Post-attention RMSNorm
-        metal_enqueue_rms_norm_batched(s->mb_x, lw->post_attn_norm_g, s->mb_ln, D, eps, BN);
-        metal_enqueue_copy(s->mb_ln, sv->ln2_out, BN * D);
-
-        // SwiGLU FFN
+        // FFN
         metal_enqueue_f16_matmul(s->mb_ln, lw->gate_proj->mbuf, s->mb_gate, BN, IS, D);
         metal_enqueue_copy(s->mb_gate, sv->gate_pre, BN * IS);
         metal_enqueue_f16_matmul(s->mb_ln, lw->up_proj->mbuf, s->mb_up, BN, IS, D);
         metal_enqueue_copy(s->mb_up, sv->up_val, BN * IS);
-        metal_enqueue_silu_mul(s->mb_gate, s->mb_up, BN * IS);
+
+        if (is_gemma3) {
+            metal_enqueue_gelu_mul(s->mb_gate, s->mb_up, BN * IS);
+        } else {
+            metal_enqueue_silu_mul(s->mb_gate, s->mb_up, BN * IS);
+        }
+
         metal_enqueue_f16_matmul(s->mb_gate, lw->down_proj->mbuf, s->mb_ff, BN, D, IS);
 
-        // Residual add
-        metal_enqueue_residual_add(s->mb_x, s->mb_ff, BN * D);
+        if (is_gemma3) {
+            // Gemma3: down_proj → post_ff_norm → residual_add
+            metal_enqueue_copy(s->mb_ff, sv->ff_raw_out, BN * D);
+            metal_enqueue_rms_norm_batched(s->mb_ff, lw->post_ff_norm_g, s->mb_ff, D, eps, BN);
+            metal_enqueue_residual_add(s->mb_x, s->mb_ff, BN * D);
+        } else {
+            // Qwen3: down_proj → residual_add
+            metal_enqueue_residual_add(s->mb_x, s->mb_ff, BN * D);
+        }
     }
 
     // Save x before final norm
@@ -380,7 +507,6 @@ static void sft_forward(SFTState *s) {
     // Softmax CE loss + gradient
     metal_enqueue_softmax_ce(s->mb_logits, s->mb_targets, s->mb_losses,
                               s->mb_dlogits, BN, s->V);
-    // Scale dlogits by 1/N for mean loss gradient
     metal_enqueue_scale(s->mb_dlogits, 1.0f / (float)BN, BN * s->V);
 }
 
@@ -394,9 +520,10 @@ static void sft_backward(SFTState *s) {
     int Hq_hd = Hq * hd, Hkv_hd = Hkv * hd;
     float eps = s->eps, sc = s->lora_scaling;
     float attn_scale = 1.0f / sqrtf((float)hd);
-    float grad_clip = 1e6f;  // only prevents float32 overflow, not gradient explosion
+    float grad_clip = 1e6f;
+    int is_gemma3 = (s->model_type == MODEL_GEMMA3);
 
-    // Backward through LM head: dx = dlogits @ W_lm_head
+    // Backward through LM head
     metal_enqueue_f16_matmul_nt(s->mb_dlogits, s->lm_head->mbuf, s->mb_dx, BN, s->V, D);
 
     // Backward through final RMSNorm
@@ -410,18 +537,48 @@ static void sft_backward(SFTState *s) {
         LayerSave *sv = &s->saves[L];
 
         // === FFN Backward ===
-        metal_enqueue_f16_matmul_nt(s->mb_dx, lw->down_proj->mbuf, s->mb_gate, BN, D, IS);
-        metal_enqueue_silu_mul_backward(s->mb_gate, sv->gate_pre, sv->up_val,
-                                         s->mb_gate, s->mb_up, BN * IS);
-        metal_enqueue_f16_matmul_nt(s->mb_gate, lw->gate_proj->mbuf, s->mb_ln, BN, IS, D);
-        metal_enqueue_f16_matmul_nt(s->mb_up, lw->up_proj->mbuf, s->mb_x2, BN, IS, D);
-        metal_enqueue_residual_add(s->mb_ln, s->mb_x2, BN * D);
-        metal_enqueue_rms_norm_backward(sv->x_mid, s->mb_ln, lw->post_attn_norm_g,
-                                         s->mb_dx2, BN, D, eps);
-        metal_enqueue_residual_add(s->mb_dx, s->mb_dx2, BN * D);
+        if (is_gemma3) {
+            // Gemma3: dx → rms_norm_bwd(ff_raw_out, dx, post_ff_norm_g) → dx2
+            metal_enqueue_rms_norm_backward(sv->ff_raw_out, s->mb_dx, lw->post_ff_norm_g,
+                                             s->mb_dx2, BN, D, eps);
+            // dx2 → down_proj^T → gate_grad
+            metal_enqueue_f16_matmul_nt(s->mb_dx2, lw->down_proj->mbuf, s->mb_gate, BN, D, IS);
+            // gate_grad → gelu_mul_backward
+            metal_enqueue_gelu_mul_backward(s->mb_gate, sv->gate_pre, sv->up_val,
+                                             s->mb_gate, s->mb_up, BN * IS);
+            // gate/up → gate_proj^T, up_proj^T → d_pre_ff_norm_out
+            metal_enqueue_f16_matmul_nt(s->mb_gate, lw->gate_proj->mbuf, s->mb_ln, BN, IS, D);
+            metal_enqueue_f16_matmul_nt(s->mb_up, lw->up_proj->mbuf, s->mb_x2, BN, IS, D);
+            metal_enqueue_residual_add(s->mb_ln, s->mb_x2, BN * D);
+            // d_pre_ff_norm_out → rms_norm_bwd(x_mid, ln, pre_ff_norm_g) → dx2
+            metal_enqueue_rms_norm_backward(sv->x_mid, s->mb_ln, lw->pre_ff_norm_g,
+                                             s->mb_dx2, BN, D, eps);
+            metal_enqueue_residual_add(s->mb_dx, s->mb_dx2, BN * D);
+        } else {
+            // Qwen3: original path
+            metal_enqueue_f16_matmul_nt(s->mb_dx, lw->down_proj->mbuf, s->mb_gate, BN, D, IS);
+            metal_enqueue_silu_mul_backward(s->mb_gate, sv->gate_pre, sv->up_val,
+                                             s->mb_gate, s->mb_up, BN * IS);
+            metal_enqueue_f16_matmul_nt(s->mb_gate, lw->gate_proj->mbuf, s->mb_ln, BN, IS, D);
+            metal_enqueue_f16_matmul_nt(s->mb_up, lw->up_proj->mbuf, s->mb_x2, BN, IS, D);
+            metal_enqueue_residual_add(s->mb_ln, s->mb_x2, BN * D);
+            metal_enqueue_rms_norm_backward(sv->x_mid, s->mb_ln, lw->post_attn_norm_g,
+                                             s->mb_dx2, BN, D, eps);
+            metal_enqueue_residual_add(s->mb_dx, s->mb_dx2, BN * D);
+        }
 
         // === Attention Backward ===
-        metal_enqueue_f16_matmul_nt(s->mb_dx, lw->o_proj->mbuf, s->mb_attn_flat, BN, D, Hq_hd);
+        if (is_gemma3) {
+            // Gemma3: dx → rms_norm_bwd(o_proj_out, dx, post_attn_norm_g) → dx2
+            metal_enqueue_rms_norm_backward(sv->o_proj_out, s->mb_dx, lw->post_attn_norm_g,
+                                             s->mb_dx2, BN, D, eps);
+            // dx2 → o_proj^T → attn_flat
+            metal_enqueue_f16_matmul_nt(s->mb_dx2, lw->o_proj->mbuf, s->mb_attn_flat, BN, D, Hq_hd);
+        } else {
+            // Qwen3: dx → o_proj^T → attn_flat
+            metal_enqueue_f16_matmul_nt(s->mb_dx, lw->o_proj->mbuf, s->mb_attn_flat, BN, D, Hq_hd);
+        }
+
         metal_enqueue_transpose_heads_fwd(s->mb_attn_flat, s->mb_attn_out, BN, Hq, hd);
         metal_enqueue_attn_bwd_dq(s->mb_attn_out, sv->probs, sv->v_exp,
                                    sv->k_exp, s->mb_d_score, s->mb_q_t,
@@ -431,7 +588,7 @@ static void sft_backward(SFTState *s) {
                                     Hq, BN, hd);
         metal_enqueue_repeat_kv_bwd(s->mb_k_exp, s->mb_k_t, Hkv, BN, hd, s->group_ratio);
         metal_enqueue_repeat_kv_bwd(s->mb_v_exp, s->mb_v_t, Hkv, BN, hd, s->group_ratio);
-        metal_enqueue_rope_train_bwd(s->mb_q_t, s->mb_k_t, Hq, Hkv, hd, BN, s->rope_theta);
+        metal_enqueue_rope_train_bwd(s->mb_q_t, s->mb_k_t, Hq, Hkv, hd, BN, s->rope_thetas[L]);
         metal_enqueue_rms_norm_backward(sv->q_pre_norm, s->mb_q_t, lw->q_norm_g,
                                          s->mb_q_t, Hq * BN, hd, eps);
         metal_enqueue_rms_norm_backward(sv->k_pre_norm, s->mb_k_t, lw->k_norm_g,
@@ -471,7 +628,7 @@ static void sft_backward(SFTState *s) {
                                          s->mb_dx2, BN, D, eps);
         metal_enqueue_residual_add(s->mb_dx, s->mb_dx2, BN * D);
 
-        // Gradient clipping to prevent explosion through deep layers
+        // Gradient clipping
         metal_enqueue_clamp(s->mb_dx, grad_clip, BN * D);
     }
 }
@@ -496,7 +653,6 @@ static void adamw_update(float *param, float *grad, float *m, float *v,
 }
 
 static void clip_grad_norm(SFTState *s, float max_norm) {
-    // Compute global gradient L2 norm across all LoRA parameters
     double total_sq = 0;
     for (int L = 0; L < s->NL; L++) {
         LoRAW *lr = &s->lora[L];
@@ -530,7 +686,6 @@ static void lora_update(SFTState *s, float lr) {
     float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f, wd = 0.01f;
     int step = s->step_count;
 
-    // Global gradient norm clipping (max_grad_norm = 1.0)
     clip_grad_norm(s, 1.0f);
 
     for (int L = 0; L < s->NL; L++) {
@@ -555,9 +710,15 @@ float sft_train_step(SFTState *s, const uint32_t *input_tokens,
     int BN = s->N;
     int D = s->D;
 
-    // Embedding lookup (CPU → shared GPU buffer)
+    // Embedding lookup (CPU -> shared GPU buffer)
     for (int i = 0; i < BN; i++)
         memcpy(s->x_cpu + i * D, &s->token_emb[input_tokens[i] * D], D * sizeof(float));
+
+    // Gemma3: scale embeddings by sqrt(d_model)
+    if (s->model_type == MODEL_GEMMA3) {
+        for (int i = 0; i < BN * D; i++)
+            s->x_cpu[i] *= s->emb_scale;
+    }
 
     // Copy targets to GPU
     memcpy(metal_buf_ptr(s->mb_targets), target_tokens, BN * sizeof(uint32_t));
@@ -604,6 +765,23 @@ void sft_sync_lora_to_model(SFTState *s, Qwen3Model *model) {
     }
 }
 
+void sft_sync_lora_to_gemma3(SFTState *s, Gemma3Model *model) {
+    if (!model->q_loras) {
+        gemma3_attach_lora(model, s->lora_rank, s->lora_scaling * s->lora_rank);
+    }
+    for (int L = 0; L < s->NL; L++) {
+        LoRAW *lr = &s->lora[L];
+        memcpy(model->q_loras[L]->lora_A->data, metal_buf_ptr(lr->A_q),
+               lr->Aq_size * sizeof(float));
+        memcpy(model->q_loras[L]->lora_B->data, metal_buf_ptr(lr->B_q),
+               lr->Bq_size * sizeof(float));
+        memcpy(model->v_loras[L]->lora_A->data, metal_buf_ptr(lr->A_v),
+               lr->Av_size * sizeof(float));
+        memcpy(model->v_loras[L]->lora_B->data, metal_buf_ptr(lr->B_v),
+               lr->Bv_size * sizeof(float));
+    }
+}
+
 // ================================================================
 // Cleanup
 // ================================================================
@@ -611,14 +789,6 @@ void sft_sync_lora_to_model(SFTState *s, Qwen3Model *model) {
 void sft_state_free(SFTState *s) {
     if (!s) return;
     for (int i = 0; i < s->NL; i++) {
-        LayerW *lw = &s->layers[i];
-        wmat_free(lw->q_proj); wmat_free(lw->k_proj);
-        wmat_free(lw->v_proj); wmat_free(lw->o_proj);
-        wmat_free(lw->gate_proj); wmat_free(lw->up_proj);
-        wmat_free(lw->down_proj);
-        metal_buf_free(lw->input_norm_g); metal_buf_free(lw->post_attn_norm_g);
-        metal_buf_free(lw->q_norm_g); metal_buf_free(lw->k_norm_g);
-
         LoRAW *lr = &s->lora[i];
         metal_buf_free(lr->A_q); metal_buf_free(lr->B_q);
         metal_buf_free(lr->A_v); metal_buf_free(lr->B_v);
@@ -635,8 +805,11 @@ void sft_state_free(SFTState *s) {
         metal_buf_free(sv->x_mid); metal_buf_free(sv->ln2_out);
         metal_buf_free(sv->gate_pre); metal_buf_free(sv->up_val);
         metal_buf_free(sv->lora_q_mid); metal_buf_free(sv->lora_v_mid);
+        if (sv->o_proj_out) metal_buf_free(sv->o_proj_out);
+        if (sv->ff_raw_out) metal_buf_free(sv->ff_raw_out);
     }
-    free(s->layers); free(s->lora); free(s->saves);
+    layers_free(s->layers, s->NL);
+    free(s->lora); free(s->saves);
     wmat_free(s->lm_head);
     metal_buf_free(s->final_norm_g);
     metal_buf_free(s->save_x_final); metal_buf_free(s->save_ln_final);
@@ -655,6 +828,7 @@ void sft_state_free(SFTState *s) {
     metal_buf_free(s->mb_dx); metal_buf_free(s->mb_dx2);
     metal_buf_free(s->mb_d_score);
 
+    free(s->rope_thetas);
     fast_metal_shutdown();
     free(s);
 }

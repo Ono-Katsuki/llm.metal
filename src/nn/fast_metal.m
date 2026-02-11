@@ -54,6 +54,8 @@ static id<MTLComputePipelineState> g_float_matmul_tn_ps = nil;
 static id<MTLComputePipelineState> g_float_matmul_nt_ps = nil;
 static id<MTLComputePipelineState> g_buf_copy_ps = nil;
 static id<MTLComputePipelineState> g_clamp_ps = nil;
+static id<MTLComputePipelineState> g_gelu_mul = nil;
+static id<MTLComputePipelineState> g_gelu_mul_bwd_ps = nil;
 
 // Single command buffer + encoder reused across all dispatches per flush
 static id<MTLCommandBuffer> g_cmdbuf;
@@ -138,6 +140,8 @@ int fast_metal_init(void) {
         MAKE_PSO(g_float_matmul_nt_ps,  "float_matmul_nt");
         MAKE_PSO(g_buf_copy_ps,         "buf_copy");
         MAKE_PSO(g_clamp_ps,            "clamp_tensor");
+        MAKE_PSO(g_gelu_mul,            "gelu_mul");
+        MAKE_PSO(g_gelu_mul_bwd_ps,     "gelu_mul_backward");
 
         #undef MAKE_PSO
 
@@ -165,7 +169,7 @@ void fast_metal_shutdown(void) {
     g_attn_train_fwd_ps = nil; g_attn_bwd_dq_ps = nil; g_attn_bwd_dkv_ps = nil;
     g_repeat_kv_bwd_ps = nil; g_rope_train_bwd_ps = nil;
     g_float_matmul_ps = nil; g_float_matmul_tn_ps = nil; g_float_matmul_nt_ps = nil;
-    g_buf_copy_ps = nil; g_clamp_ps = nil;
+    g_buf_copy_ps = nil; g_clamp_ps = nil; g_gelu_mul = nil; g_gelu_mul_bwd_ps = nil;
     g_enc = nil; g_cmdbuf = nil;
     g_queue = nil; g_dev = nil;
 }
@@ -417,6 +421,18 @@ void metal_enqueue_silu_mul(MetalBuf *gate_buf, MetalBuf *up_buf, int n) {
     barrier();
 }
 
+void metal_enqueue_gelu_mul(MetalBuf *gate_buf, MetalBuf *up_buf, int n) {
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:g_gelu_mul];
+    [enc setBuffer:gate_buf->buf offset:0 atIndex:0];
+    [enc setBuffer:up_buf->buf offset:0 atIndex:1];
+
+    NSUInteger tg = MIN(256, (NSUInteger)n);
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    barrier();
+}
+
 void metal_enqueue_residual_add(MetalBuf *x_buf, MetalBuf *y_buf, int n) {
     id<MTLComputeCommandEncoder> enc = get_encoder();
     [enc setComputePipelineState:g_residual_add];
@@ -643,6 +659,21 @@ void metal_enqueue_silu_mul_backward(MetalBuf *dout, MetalBuf *gate, MetalBuf *u
                                       MetalBuf *dgate, MetalBuf *dup, int n) {
     id<MTLComputeCommandEncoder> enc = get_encoder();
     [enc setComputePipelineState:g_silu_mul_bwd_ps];
+    [enc setBuffer:dout->buf offset:0 atIndex:0];
+    [enc setBuffer:gate->buf offset:0 atIndex:1];
+    [enc setBuffer:up->buf offset:0 atIndex:2];
+    [enc setBuffer:dgate->buf offset:0 atIndex:3];
+    [enc setBuffer:dup->buf offset:0 atIndex:4];
+
+    [enc dispatchThreadgroups:MTLSizeMake((n + 255) / 256, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+}
+
+void metal_enqueue_gelu_mul_backward(MetalBuf *dout, MetalBuf *gate, MetalBuf *up,
+                                      MetalBuf *dgate, MetalBuf *dup, int n) {
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:g_gelu_mul_bwd_ps];
     [enc setBuffer:dout->buf offset:0 atIndex:0];
     [enc setBuffer:gate->buf offset:0 atIndex:1];
     [enc setBuffer:up->buf offset:0 atIndex:2];

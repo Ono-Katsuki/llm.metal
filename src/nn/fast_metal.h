@@ -56,6 +56,9 @@ void metal_enqueue_attention(MetalBuf *Q_buf, MetalBuf *Kc_buf, MetalBuf *Vc_buf
 // Enqueue SiLU(gate) * up — modifies gate in place
 void metal_enqueue_silu_mul(MetalBuf *gate_buf, MetalBuf *up_buf, int n);
 
+// Enqueue GELU(gate) * up — modifies gate in place (for GeGLU)
+void metal_enqueue_gelu_mul(MetalBuf *gate_buf, MetalBuf *up_buf, int n);
+
 // Enqueue residual add: x += y
 void metal_enqueue_residual_add(MetalBuf *x_buf, MetalBuf *y_buf, int n);
 
@@ -107,6 +110,10 @@ void metal_enqueue_rope_train(MetalBuf *q_buf, MetalBuf *k_buf,
 
 // SiLU*mul backward
 void metal_enqueue_silu_mul_backward(MetalBuf *dout, MetalBuf *gate, MetalBuf *up,
+                                      MetalBuf *dgate, MetalBuf *dup, int n);
+
+// GELU*mul backward (for GeGLU)
+void metal_enqueue_gelu_mul_backward(MetalBuf *dout, MetalBuf *gate, MetalBuf *up,
                                       MetalBuf *dgate, MetalBuf *dup, int n);
 
 // RMSNorm backward for training

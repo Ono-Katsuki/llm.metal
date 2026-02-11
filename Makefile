@@ -25,6 +25,8 @@ C_SRCS   = $(SRC_DIR)/core/tensor.c \
            $(SRC_DIR)/nn/optimizer.c \
            $(SRC_DIR)/nn/lora.c \
            $(SRC_DIR)/nn/qwen3.c \
+           $(SRC_DIR)/nn/gemma3.c \
+           $(SRC_DIR)/nn/wmat.c \
            $(SRC_DIR)/nn/fast_inference.c \
            $(SRC_DIR)/nn/fast_sft.c \
            $(SRC_DIR)/data/tokenizer.c \
@@ -128,8 +130,10 @@ $(BUILD_DIR)/nn/transformer.o: $(SRC_DIR)/nn/transformer.h $(SRC_DIR)/nn/attenti
 $(BUILD_DIR)/nn/optimizer.o: $(SRC_DIR)/nn/optimizer.h $(SRC_DIR)/nn/layers.h
 $(BUILD_DIR)/nn/lora.o: $(SRC_DIR)/nn/lora.h $(SRC_DIR)/nn/layers.h $(SRC_DIR)/core/tensor.h $(SRC_DIR)/core/autograd.h
 $(BUILD_DIR)/nn/qwen3.o: $(SRC_DIR)/nn/qwen3.h $(SRC_DIR)/nn/layers.h $(SRC_DIR)/nn/attention.h $(SRC_DIR)/nn/lora.h $(SRC_DIR)/data/gguf.h $(SRC_DIR)/data/safetensors.h
-$(BUILD_DIR)/nn/fast_inference.o: $(SRC_DIR)/nn/fast_inference.h $(SRC_DIR)/nn/qwen3.h $(SRC_DIR)/nn/fast_metal.h
-$(BUILD_DIR)/nn/fast_sft.o: $(SRC_DIR)/nn/fast_sft.h $(SRC_DIR)/nn/qwen3.h $(SRC_DIR)/nn/fast_metal.h
+$(BUILD_DIR)/nn/gemma3.o: $(SRC_DIR)/nn/gemma3.h $(SRC_DIR)/nn/layers.h $(SRC_DIR)/nn/attention.h $(SRC_DIR)/nn/lora.h $(SRC_DIR)/data/safetensors.h
+$(BUILD_DIR)/nn/wmat.o: $(SRC_DIR)/nn/wmat.h $(SRC_DIR)/nn/fast_metal.h
+$(BUILD_DIR)/nn/fast_inference.o: $(SRC_DIR)/nn/fast_inference.h $(SRC_DIR)/nn/wmat.h $(SRC_DIR)/nn/qwen3.h $(SRC_DIR)/nn/gemma3.h $(SRC_DIR)/nn/fast_metal.h
+$(BUILD_DIR)/nn/fast_sft.o: $(SRC_DIR)/nn/fast_sft.h $(SRC_DIR)/nn/wmat.h $(SRC_DIR)/nn/qwen3.h $(SRC_DIR)/nn/fast_metal.h
 $(BUILD_DIR)/nn/fast_metal.o: $(SRC_DIR)/nn/fast_metal.h
 $(BUILD_DIR)/data/tokenizer.o: $(SRC_DIR)/data/tokenizer.h
 $(BUILD_DIR)/data/dataloader.o: $(SRC_DIR)/data/dataloader.h $(SRC_DIR)/data/tokenizer.h
