@@ -45,7 +45,7 @@ static void quantize_row_q8(const float *src, block_q8 *dst, int n_blocks) {
 // Weight matrix: Q8_0 or F16 data in Metal buffer
 // ==================================================================
 
-typedef struct {
+typedef struct WMat {
     MetalBuf *mbuf;
     int rows, cols, nb;  // nb used only for Q8_0 (cols/32)
 } WMat;
@@ -97,7 +97,7 @@ typedef struct {
     MetalBuf *q_norm_g, *k_norm_g;
 } LayerW;
 
-typedef struct {
+struct InferenceState {
     int d_model, n_q_heads, n_kv_heads, head_dim, intermediate_size, vocab_size;
     int n_layers, max_seq_len;
     float rope_theta;
@@ -120,7 +120,7 @@ typedef struct {
     WMat *lm_head;
     MetalBuf *mb_final_norm_g;
     const float *token_emb;
-} InferenceState;
+};
 
 static MetalBuf *make_buf(size_t bytes, float **cpu_ptr) {
     MetalBuf *mb = metal_buf_create(bytes);
@@ -137,7 +137,11 @@ static inline void dispatch_matvec(InferenceState *s, WMat *w,
         metal_enqueue_q8_matvec(w->mbuf, x_buf, y_buf, w->rows, w->nb);
 }
 
-static InferenceState *state_create(Qwen3Model *m, int max_seq_len, int use_fp16) {
+InferenceState *inference_state_create(Qwen3Model *m, int max_seq_len, int use_fp16) {
+    if (fast_metal_init() != 0) {
+        fprintf(stderr, "[FastGen] Metal init failed\n");
+        return NULL;
+    }
     if (max_seq_len > 4096) {
         printf("[FastGen] Warning: clamping max_seq_len to 4096 (kernel limit)\n");
         max_seq_len = 4096;
@@ -251,7 +255,7 @@ static InferenceState *state_create(Qwen3Model *m, int max_seq_len, int use_fp16
     return s;
 }
 
-static void state_free(InferenceState *s) {
+void inference_state_free(InferenceState *s) {
     if (!s) return;
     metal_buf_free(s->mb_x); metal_buf_free(s->mb_x2); metal_buf_free(s->mb_ln_out);
     metal_buf_free(s->mb_q); metal_buf_free(s->mb_k); metal_buf_free(s->mb_v);
@@ -275,6 +279,7 @@ static void state_free(InferenceState *s) {
     free(s->mb_k_cache); free(s->mb_v_cache);
     free(s->layers);
     wmat_free(s->lm_head);
+    fast_metal_shutdown();
     free(s);
 }
 
@@ -340,18 +345,14 @@ static int argmax(const float *v, int n) {
 }
 
 // ==================================================================
-// Main generate function
+// inference_generate: run one request on a persistent state
 // ==================================================================
 
-int qwen3_generate_fast(Qwen3Model *model, const uint32_t *prompt_tokens,
-                        int prompt_len, uint32_t *output_tokens,
-                        int max_gen_len, int max_seq_len, int use_fp16) {
-    if (fast_metal_init() != 0) {
-        fprintf(stderr, "[FastGen] Metal init failed\n");
-        return 0;
-    }
-
-    InferenceState *s = state_create(model, max_seq_len, use_fp16);
+int inference_generate(InferenceState *state,
+                       const uint32_t *prompt_tokens, int prompt_len,
+                       uint32_t *output_tokens, int max_gen_len) {
+    InferenceState *s = state;
+    s->cur_len = 0;  // reset KV cache position
 
     struct timespec t0, t1;
 
@@ -378,7 +379,7 @@ int qwen3_generate_fast(Qwen3Model *model, const uint32_t *prompt_tokens,
     printf("[FastGen] Decoding...\n");
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    for (int gen = 1; gen < max_gen_len && s->cur_len < max_seq_len; gen++) {
+    for (int gen = 1; gen < max_gen_len && s->cur_len < s->max_seq_len; gen++) {
         if (next_token == 151645 || next_token == 151643 || next_token == 0) break;
 
         forward_token(s, next_token, s->cur_len);
@@ -404,8 +405,23 @@ int qwen3_generate_fast(Qwen3Model *model, const uint32_t *prompt_tokens,
                decode_ms / n_decoded);
     }
 
-    state_free(s);
-    fast_metal_shutdown();
+    return n_gen;
+}
+
+// ==================================================================
+// One-shot convenience wrapper
+// ==================================================================
+
+int qwen3_generate_fast(Qwen3Model *model, const uint32_t *prompt_tokens,
+                        int prompt_len, uint32_t *output_tokens,
+                        int max_gen_len, int max_seq_len, int use_fp16) {
+    InferenceState *s = inference_state_create(model, max_seq_len, use_fp16);
+    if (!s) return 0;
+
+    int n_gen = inference_generate(s, prompt_tokens, prompt_len,
+                                   output_tokens, max_gen_len);
+
+    inference_state_free(s);
     return n_gen;
 }
 

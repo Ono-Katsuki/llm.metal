@@ -144,7 +144,8 @@ static void print_usage(const char *prog) {
     printf("Modes:\n");
     printf("  --mode train        GPT pre-training (default)\n");
     printf("  --mode sft          Qwen3 LoRA SFT with GGUF weights\n");
-    printf("  --mode generate     Qwen3 text generation\n\n");
+    printf("  --mode generate     Qwen3 text generation\n");
+    printf("  --mode serve        Persistent inference (binary stdin/stdout)\n\n");
     printf("General options:\n");
     printf("  --preset <name>     Model preset: tiny, 125M, 350M\n");
     printf("  --layers <n>        Number of transformer layers\n");
@@ -495,6 +496,101 @@ static void run_generate(Config *cfg) {
 }
 
 // ==================================================================
+// Serve mode — persistent model, binary stdin/stdout protocol
+// ==================================================================
+
+static void run_serve(Config *cfg) {
+    if (!cfg->gguf_path[0]) {
+        fprintf(stderr, "[Serve] Error: --model is required for serve mode\n");
+        return;
+    }
+
+    fprintf(stderr, "[Serve] Loading model: %s\n", cfg->gguf_path);
+    Qwen3Model *model = load_model_auto(cfg->gguf_path);
+    if (!model) {
+        fprintf(stderr, "[Serve] Failed to load model\n");
+        return;
+    }
+
+    // Load LoRA adapter if specified
+    if (cfg->lora_adapter[0]) {
+        qwen3_attach_lora(model, cfg->lora_rank, cfg->lora_alpha);
+        qwen3_load_lora(model, cfg->lora_adapter);
+        for (int i = 0; i < model->n_layers; i++) {
+            lora_merge(model->q_loras[i]);
+            lora_merge(model->v_loras[i]);
+        }
+        fprintf(stderr, "[Serve] LoRA merged into base weights\n");
+    }
+
+    int max_seq_len = cfg->max_gen_len + 512;
+    if (max_seq_len > 4096) max_seq_len = 4096;
+
+    InferenceState *state = inference_state_create(model, max_seq_len, cfg->use_fp16);
+    if (!state) {
+        fprintf(stderr, "[Serve] Failed to create inference state\n");
+        qwen3_free(model);
+        return;
+    }
+
+    fprintf(stderr, "[Serve] Ready. Waiting for requests on stdin...\n");
+    fflush(stderr);
+
+    // Binary protocol (little-endian uint32):
+    //   Request:  [prompt_len] [max_gen_len] [prompt_len × token_ids]
+    //   Response: [n_generated] [n_generated × token_ids]
+    //   prompt_len == 0 → shutdown
+
+    uint32_t *prompt_buf = NULL;
+    size_t prompt_cap = 0;
+    uint32_t *output_buf = calloc(4096, sizeof(uint32_t));
+
+    for (;;) {
+        uint32_t header[2];
+        if (fread(header, sizeof(uint32_t), 2, stdin) != 2) break;
+
+        uint32_t prompt_len = header[0];
+        uint32_t max_gen   = header[1];
+
+        if (prompt_len == 0) {
+            fprintf(stderr, "[Serve] Shutdown signal received\n");
+            break;
+        }
+
+        // Grow prompt buffer if needed
+        if (prompt_len > prompt_cap) {
+            prompt_cap = prompt_len;
+            prompt_buf = realloc(prompt_buf, prompt_cap * sizeof(uint32_t));
+        }
+
+        if (fread(prompt_buf, sizeof(uint32_t), prompt_len, stdin) != prompt_len) {
+            fprintf(stderr, "[Serve] Error reading prompt tokens\n");
+            break;
+        }
+
+        if (max_gen > 4096) max_gen = 4096;
+
+        fprintf(stderr, "[Serve] Request: prompt_len=%u max_gen=%u\n", prompt_len, max_gen);
+
+        int n_gen = inference_generate(state, prompt_buf, (int)prompt_len,
+                                        output_buf, (int)max_gen);
+
+        // Write response
+        uint32_t n = (uint32_t)n_gen;
+        fwrite(&n, sizeof(uint32_t), 1, stdout);
+        fwrite(output_buf, sizeof(uint32_t), n_gen, stdout);
+        fflush(stdout);
+
+        fprintf(stderr, "[Serve] Response: %d tokens generated\n", n_gen);
+    }
+
+    free(prompt_buf);
+    free(output_buf);
+    inference_state_free(state);
+    qwen3_free(model);
+}
+
+// ==================================================================
 // GPT Pre-training (original mode)
 // ==================================================================
 
@@ -597,6 +693,8 @@ int main(int argc, char **argv) {
         run_sft(&cfg);
     } else if (strcmp(cfg.mode, "generate") == 0) {
         run_generate(&cfg);
+    } else if (strcmp(cfg.mode, "serve") == 0) {
+        run_serve(&cfg);
     } else {
         run_train(&cfg);
     }
