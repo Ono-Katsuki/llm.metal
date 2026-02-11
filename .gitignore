@@ -1,0 +1,12 @@
+build/
+llm_train
+debug_forward
+debug_gguf
+test_qwen3
+models/
+checkpoints/
+sft/data/*.bin
+*.o
+*.air
+*.metallib
+.DS_Store
