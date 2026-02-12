@@ -15,6 +15,7 @@
 #include "src/nn/gemma3.h"
 #include "src/nn/fast_inference.h"
 #include "src/nn/fast_sft.h"
+#include "src/nn/fast_grpo.h"
 #include "src/data/tokenizer.h"
 #include "src/data/dataloader.h"
 #include "src/train/trainer.h"
@@ -68,6 +69,16 @@ typedef struct {
     int max_gen_len;         // max generation length
     int use_fp16;            // 1 = F16 weights, 0 = Q8_0 quantized
     int gen_batch;           // batch size for parallel generation
+
+    // GRPO mode
+    int group_size;          // completions per prompt (default: 4)
+    float temperature;       // sampling temperature (default: 0.7)
+    float clip_eps;          // PPO clip epsilon (default: 0.2)
+    char reward[32];         // reward function name
+
+    // Full-param SFT
+    int full_param;          // 1 = full-param SGD (no LoRA)
+    int accurate;            // 1 = grad accumulation (paper-correct full-param)
 } Config;
 
 static Config default_config(void) {
@@ -99,6 +110,10 @@ static Config default_config(void) {
     c.lora_rank = 16;
     c.lora_alpha = 32.0f;
     c.max_gen_len = 128;
+    c.group_size = 4;
+    c.temperature = 0.7f;
+    c.clip_eps = 0.2f;
+    strncpy(c.reward, "combined", 31);
     return c;
 }
 
@@ -147,7 +162,8 @@ static void print_usage(const char *prog) {
     printf("  --mode train        GPT pre-training (default)\n");
     printf("  --mode sft          Qwen3 LoRA SFT with GGUF weights\n");
     printf("  --mode generate     Qwen3 text generation\n");
-    printf("  --mode serve        Persistent inference (binary stdin/stdout)\n\n");
+    printf("  --mode serve        Persistent inference (binary stdin/stdout)\n");
+    printf("  --mode grpo         GRPO reinforcement learning\n\n");
     printf("General options:\n");
     printf("  --preset <name>     Model preset: tiny, 125M, 350M\n");
     printf("  --layers <n>        Number of transformer layers\n");
@@ -168,13 +184,20 @@ static void print_usage(const char *prog) {
     printf("  --gguf <path>       GGUF model file (alias for --model)\n");
     printf("  --lora-rank <n>     LoRA rank (default: 16)\n");
     printf("  --lora-alpha <f>    LoRA alpha (default: 32)\n");
-    printf("  --lora-adapter <p>  LoRA adapter file (load/save)\n\n");
+    printf("  --lora-adapter <p>  LoRA adapter file (load/save)\n");
+    printf("  --full-param        Full-parameter SGD (no LoRA, online fused backward)\n");
+    printf("  --accurate          Full-parameter with grad accumulation (paper-correct)\n\n");
     printf("Generate options:\n");
     printf("  --prompt <text>     Prompt text\n");
     printf("  --tokens <file>     Pre-tokenized prompt (uint32 binary)\n");
     printf("  --max-gen-len <n>   Max generation length (default: 128)\n");
     printf("  --fp16              Use F16 weights instead of Q8_0 quantization\n");
-    printf("  --gen-batch <n>     Batch size for parallel generation (F16 only)\n");
+    printf("  --gen-batch <n>     Batch size for parallel generation (F16 only)\n\n");
+    printf("GRPO options:\n");
+    printf("  --group-size <n>    Completions per prompt (default: 4)\n");
+    printf("  --temperature <f>   Sampling temperature (default: 0.7)\n");
+    printf("  --clip-eps <f>      PPO clip epsilon (default: 0.2)\n");
+    printf("  --reward <name>     \"length\", \"repetition\", \"combined\" (default: combined)\n");
     printf("  --help              Show this message\n");
 }
 
@@ -236,6 +259,19 @@ static Config parse_args(int argc, char **argv) {
             c.gen_batch = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--test") == 0) {
             c.test_mode = 1;
+        } else if (strcmp(argv[i], "--group-size") == 0 && i + 1 < argc) {
+            c.group_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
+            c.temperature = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--clip-eps") == 0 && i + 1 < argc) {
+            c.clip_eps = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--reward") == 0 && i + 1 < argc) {
+            strncpy(c.reward, argv[++i], 31);
+        } else if (strcmp(argv[i], "--full-param") == 0) {
+            c.full_param = 1;
+        } else if (strcmp(argv[i], "--accurate") == 0) {
+            c.full_param = 1;  // accurate implies full-param
+            c.accurate = 1;
         }
     }
     return c;
@@ -336,10 +372,12 @@ static void run_sft(Config *cfg) {
     float lr = cfg->lr > 0 ? cfg->lr : 1e-5f;
     ModelType mtype = detect_model_type(cfg->gguf_path);
     const char *model_name = (mtype == MODEL_GEMMA3) ? "Gemma3" : "Qwen3";
+    const char *mode_name = cfg->full_param ? "Full-param SGD" : "LoRA";
 
-    printf("=== %s Fast LoRA SFT ===\n", model_name);
+    printf("=== %s Fast %s SFT ===\n", model_name, mode_name);
     printf("  Model: %s\n", cfg->gguf_path);
-    printf("  LoRA rank: %d, alpha: %.1f\n", cfg->lora_rank, cfg->lora_alpha);
+    if (!cfg->full_param)
+        printf("  LoRA rank: %d, alpha: %.1f\n", cfg->lora_rank, cfg->lora_alpha);
     printf("  Seq: %d, Steps: %d\n", cfg->seq_len, cfg->max_steps);
     printf("  LR: %.2e\n\n", lr);
 
@@ -348,7 +386,23 @@ static void run_sft(Config *cfg) {
     Qwen3Model *qmodel = NULL;
     Gemma3Model *gmodel = NULL;
 
-    if (mtype == MODEL_GEMMA3) {
+    if (cfg->full_param) {
+        if (mtype == MODEL_GEMMA3) {
+            gmodel = load_gemma3_auto(cfg->gguf_path);
+            if (!gmodel) { fprintf(stderr, "[SFT] Failed to load model\n"); return; }
+            printf("[SFT] Total model params: %zu (%.2f B)\n",
+                   gemma3_param_count(gmodel), (float)gemma3_param_count(gmodel) / 1e9f);
+            sft = sft_state_create_gemma3_full(gmodel, cfg->seq_len);
+            gemma3_free(gmodel); gmodel = NULL;
+        } else {
+            qmodel = load_model_auto(cfg->gguf_path);
+            if (!qmodel) { fprintf(stderr, "[SFT] Failed to load model\n"); return; }
+            printf("[SFT] Total model params: %zu (%.2f B)\n",
+                   qwen3_param_count(qmodel), (float)qwen3_param_count(qmodel) / 1e9f);
+            sft = sft_state_create_full(qmodel, cfg->seq_len);
+            qwen3_free(qmodel); qmodel = NULL;
+        }
+    } else if (mtype == MODEL_GEMMA3) {
         gmodel = load_gemma3_auto(cfg->gguf_path);
         if (!gmodel) { fprintf(stderr, "[SFT] Failed to load model\n"); return; }
         printf("[SFT] Total model params: %zu (%.2f B)\n",
@@ -433,20 +487,24 @@ static void run_sft(Config *cfg) {
         }
     }
 
-    // Sync LoRA weights back to model for saving
-    char lora_path[512];
-    if (cfg->lora_adapter[0]) {
-        strncpy(lora_path, cfg->lora_adapter, 511);
+    // Save checkpoint
+    char save_path[512];
+    if (cfg->full_param) {
+        snprintf(save_path, sizeof(save_path), "%s/full_checkpoint.bin", cfg->checkpoint_dir);
+        sft_save_full_checkpoint(sft, save_path);
     } else {
-        snprintf(lora_path, sizeof(lora_path), "%s/lora_adapter.bin", cfg->checkpoint_dir);
-    }
-
-    if (mtype == MODEL_GEMMA3) {
-        sft_sync_lora_to_gemma3(sft, gmodel);
-        gemma3_save_lora(gmodel, lora_path);
-    } else {
-        sft_sync_lora_to_model(sft, qmodel);
-        qwen3_save_lora(qmodel, lora_path);
+        if (cfg->lora_adapter[0]) {
+            strncpy(save_path, cfg->lora_adapter, 511);
+        } else {
+            snprintf(save_path, sizeof(save_path), "%s/lora_adapter.bin", cfg->checkpoint_dir);
+        }
+        if (mtype == MODEL_GEMMA3) {
+            sft_sync_lora_to_gemma3(sft, gmodel);
+            gemma3_save_lora(gmodel, save_path);
+        } else {
+            sft_sync_lora_to_model(sft, qmodel);
+            qwen3_save_lora(qmodel, save_path);
+        }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -454,7 +512,7 @@ static void run_sft(Config *cfg) {
                         (double)(now.tv_nsec - start.tv_nsec) / 1e9;
     printf("\n=== Fast SFT Complete ===\n");
     printf("Total time: %.1f seconds\n", total_time);
-    printf("LoRA adapter saved: %s\n", lora_path);
+    printf("Checkpoint saved: %s\n", save_path);
 
     // Cleanup
     free(input_tokens);
@@ -698,6 +756,191 @@ static void run_serve(Config *cfg) {
 }
 
 // ==================================================================
+// GRPO Reinforcement Learning
+// ==================================================================
+
+static void run_grpo(Config *cfg) {
+    if (!cfg->gguf_path[0]) {
+        fprintf(stderr, "[GRPO] Error: --model is required for GRPO mode\n");
+        return;
+    }
+    if (!cfg->train_data[0]) {
+        fprintf(stderr, "[GRPO] Error: --train <prompt_data.bin> is required for GRPO mode\n");
+        return;
+    }
+
+    float lr = cfg->lr > 0 ? cfg->lr : 1e-5f;
+    ModelType mtype = detect_model_type(cfg->gguf_path);
+    const char *model_name = (mtype == MODEL_GEMMA3) ? "Gemma3" : "Qwen3";
+
+    GRPOConfig gcfg = {
+        .group_size = cfg->group_size,
+        .max_gen_len = cfg->max_gen_len,
+        .temperature = cfg->temperature,
+        .clip_eps = cfg->clip_eps,
+        .reward = cfg->reward,
+        .accurate = cfg->accurate,
+    };
+
+    const char *mode_name = cfg->accurate ? "Full-param Accurate" :
+                            cfg->full_param ? "Full-param Online" : "LoRA";
+
+    printf("=== %s GRPO Training (%s) ===\n", model_name, mode_name);
+    printf("  Model: %s\n", cfg->gguf_path);
+    printf("  Prompts: %s\n", cfg->train_data);
+    printf("  Group size: %d, Max gen: %d\n", gcfg.group_size, gcfg.max_gen_len);
+    printf("  Temperature: %.2f, Clip eps: %.2f\n", gcfg.temperature, gcfg.clip_eps);
+    printf("  Reward: %s\n", gcfg.reward);
+    if (!cfg->full_param)
+        printf("  LoRA rank: %d, alpha: %.1f\n", cfg->lora_rank, cfg->lora_alpha);
+    printf("  Seq: %d, Steps: %d, LR: %.2e\n\n", cfg->seq_len, cfg->max_steps, lr);
+
+    // Load model, create GRPO state, then free model (weights now on GPU)
+    GRPOState *grpo = NULL;
+
+    if (cfg->full_param) {
+        if (mtype == MODEL_GEMMA3) {
+            Gemma3Model *gmodel = load_gemma3_auto(cfg->gguf_path);
+            if (!gmodel) { fprintf(stderr, "[GRPO] Failed to load model\n"); return; }
+            grpo = grpo_state_create_gemma3_full(gmodel, gcfg, cfg->seq_len, cfg->gguf_path);
+            gemma3_free(gmodel);
+        } else {
+            Qwen3Model *qmodel = load_qwen3_auto(cfg->gguf_path);
+            if (!qmodel) { fprintf(stderr, "[GRPO] Failed to load model\n"); return; }
+            grpo = grpo_state_create_full(qmodel, gcfg, cfg->seq_len, cfg->gguf_path);
+            qwen3_free(qmodel);
+        }
+    } else {
+        if (mtype == MODEL_GEMMA3) {
+            Gemma3Model *gmodel = load_gemma3_auto(cfg->gguf_path);
+            if (!gmodel) { fprintf(stderr, "[GRPO] Failed to load model\n"); return; }
+            if (cfg->lora_adapter[0]) {
+                gemma3_attach_lora(gmodel, cfg->lora_rank, cfg->lora_alpha);
+                gemma3_load_lora(gmodel, cfg->lora_adapter);
+            }
+            grpo = grpo_state_create_gemma3(gmodel, gcfg, cfg->seq_len,
+                                             cfg->lora_rank, cfg->lora_alpha,
+                                             cfg->gguf_path);
+            gemma3_free(gmodel);
+        } else {
+            Qwen3Model *qmodel = load_qwen3_auto(cfg->gguf_path);
+            if (!qmodel) { fprintf(stderr, "[GRPO] Failed to load model\n"); return; }
+            if (cfg->lora_adapter[0]) {
+                qwen3_attach_lora(qmodel, cfg->lora_rank, cfg->lora_alpha);
+                qwen3_load_lora(qmodel, cfg->lora_adapter);
+            }
+            grpo = grpo_state_create(qmodel, gcfg, cfg->seq_len,
+                                      cfg->lora_rank, cfg->lora_alpha,
+                                      cfg->gguf_path);
+            qwen3_free(qmodel);
+        }
+    }
+
+    if (!grpo) {
+        fprintf(stderr, "[GRPO] Failed to create GRPO state\n");
+        return;
+    }
+
+    printf("[GRPO] Model struct freed — running from GPU weights only\n");
+
+    // Load prompt data: [uint32 prompt_len][uint32 tokens...]...
+    FILE *fp = fopen(cfg->train_data, "rb");
+    if (!fp) {
+        fprintf(stderr, "[GRPO] Cannot open prompt data: %s\n", cfg->train_data);
+        grpo_state_free(grpo);
+        return;
+    }
+
+    // Read all prompts into memory
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    uint32_t **prompts = NULL;
+    int *prompt_lens = NULL;
+    int n_prompts = 0;
+    int prompts_cap = 64;
+    prompts = calloc(prompts_cap, sizeof(uint32_t *));
+    prompt_lens = calloc(prompts_cap, sizeof(int));
+
+    while (ftell(fp) < file_size) {
+        uint32_t plen;
+        if (fread(&plen, sizeof(uint32_t), 1, fp) != 1) break;
+        if (plen == 0 || plen > 4096) break;
+
+        uint32_t *toks = calloc(plen, sizeof(uint32_t));
+        if (fread(toks, sizeof(uint32_t), plen, fp) != plen) {
+            free(toks);
+            break;
+        }
+
+        if (n_prompts >= prompts_cap) {
+            prompts_cap *= 2;
+            prompts = realloc(prompts, prompts_cap * sizeof(uint32_t *));
+            prompt_lens = realloc(prompt_lens, prompts_cap * sizeof(int));
+        }
+        prompts[n_prompts] = toks;
+        prompt_lens[n_prompts] = (int)plen;
+        n_prompts++;
+    }
+    fclose(fp);
+    printf("[GRPO] Loaded %d prompts\n", n_prompts);
+
+    if (n_prompts == 0) {
+        fprintf(stderr, "[GRPO] No prompts loaded\n");
+        grpo_state_free(grpo);
+        free(prompts);
+        free(prompt_lens);
+        return;
+    }
+
+    // Training loop
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    printf("\n=== GRPO Training Start ===\n");
+    for (int step = 0; step < cfg->max_steps; step++) {
+        int idx = step % n_prompts;
+        float mean_reward = grpo_train_step(grpo, prompts[idx], prompt_lens[idx], lr);
+
+        if (step % cfg->log_interval == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = (double)(now.tv_sec - start.tv_sec) +
+                             (double)(now.tv_nsec - start.tv_nsec) / 1e9;
+            printf("step %5d | reward %.4f | lr %.2e | %.1fs elapsed\n",
+                   step, mean_reward, lr, elapsed);
+        }
+    }
+
+    // Save checkpoint
+    char save_path[512];
+    if (cfg->full_param) {
+        snprintf(save_path, sizeof(save_path), "%s/grpo_full_checkpoint.bin", cfg->checkpoint_dir);
+        grpo_save_full_checkpoint(grpo, save_path);
+    } else {
+        if (cfg->lora_adapter[0]) {
+            strncpy(save_path, cfg->lora_adapter, 511);
+        } else {
+            snprintf(save_path, sizeof(save_path), "%s/grpo_lora_adapter.bin", cfg->checkpoint_dir);
+        }
+        grpo_save_lora(grpo, save_path);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double total_time = (double)(now.tv_sec - start.tv_sec) +
+                        (double)(now.tv_nsec - start.tv_nsec) / 1e9;
+    printf("\n=== GRPO Complete ===\n");
+    printf("Total time: %.1f seconds\n", total_time);
+    printf("Checkpoint saved: %s\n", save_path);
+
+    // Cleanup
+    for (int i = 0; i < n_prompts; i++) free(prompts[i]);
+    free(prompts);
+    free(prompt_lens);
+    grpo_state_free(grpo);
+}
+
+// ==================================================================
 // GPT Pre-training (original mode)
 // ==================================================================
 
@@ -802,6 +1045,8 @@ int main(int argc, char **argv) {
         run_generate(&cfg);
     } else if (strcmp(cfg.mode, "serve") == 0) {
         run_serve(&cfg);
+    } else if (strcmp(cfg.mode, "grpo") == 0) {
+        run_grpo(&cfg);
     } else {
         run_train(&cfg);
     }

@@ -22,6 +22,7 @@ No PyTorch, no Python runtime — just C, Objective-C, and Metal shaders.
 
 - **Inference**: Autoregressive generation with KV cache, F16 or Q8_0 matvec
 - **SFT Training**: LoRA fine-tuning (rank 16, Q/V projections) with AdamW — **Qwen3 / Gemma3 両対応**
+- **GRPO Training**: Group Relative Policy Optimization — LoRA / Full-param Online / Full-param Accurate の 3 モード
 - **GPU Pipeline**: Single Metal command buffer — all ops (RMSNorm, RoPE, GQA, SwiGLU/GeGLU, matvec) in one GPU submission
 - **Weight Loading**: HuggingFace SafeTensors (multi-shard), GGUF
 - **Model Auto-detection**: Reads `config.json` to select Qwen3 or Gemma3 architecture
@@ -98,6 +99,41 @@ python3 tools/tokenize_sft.py --input data/sft.jsonl --output data/sft_tokens.bi
   --train data/sft_tokens.bin --steps 100 --lr 1e-4 \
   --lora-rank 16 --lora-adapter sft/gemma3_adapter.bin
 ```
+
+### 6. GRPO Training
+
+GRPO (Group Relative Policy Optimization) で強化学習ファインチューニング。
+3つのモードから選択可能：
+
+| モード | フラグ | 説明 | メモリ増分 |
+|--------|--------|------|-----------|
+| LoRA | (デフォルト) | LoRA アダプター上で AdamW 更新 | 低 |
+| Full-param Online | `--full-param` | completion ごとに即座に SGD 更新（高速） | モデル重み F16 分 |
+| Full-param Accurate | `--accurate` | F16 勾配蓄積 → 全 completion 後に 1 回 SGD（論文通り） | モデル重み F16 × 2 |
+
+```bash
+# Prepare GRPO prompts
+python3 tools/tokenize_grpo.py --input data/prompts.jsonl --output data/grpo_prompts.bin
+
+# LoRA GRPO
+./llm_train --mode grpo --model ~/models/gemma-3-1b-pt --fp16 \
+  --train data/grpo_prompts.bin --steps 100 --lr 1e-5 \
+  --group-size 4 --temperature 0.7
+
+# Full-param Online (fast, per-completion SGD)
+./llm_train --mode grpo --model ~/models/gemma-3-1b-pt --fp16 \
+  --train data/grpo_prompts.bin --steps 100 --lr 1e-5 \
+  --full-param --group-size 4
+
+# Full-param Accurate (paper-correct, grad accumulation)
+./llm_train --mode grpo --model ~/models/gemma-3-1b-pt --fp16 \
+  --train data/grpo_prompts.bin --steps 100 --lr 1e-5 \
+  --accurate --group-size 4
+```
+
+**メモリ目安 (M4 Pro 24GB):**
+- Gemma3-1B Accurate: ~1.9 GB (weights) + ~1.9 GB (grad accum) + KV cache 等
+- Qwen3-4B Accurate: ~7.7 GB (weights) + ~7.7 GB (grad accum) + KV cache 等
 
 ## Project Structure
 

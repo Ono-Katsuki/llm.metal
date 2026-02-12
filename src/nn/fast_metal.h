@@ -171,4 +171,20 @@ void metal_enqueue_copy(MetalBuf *src, MetalBuf *dst, int n);
 // Element-wise clamp: x = clamp(x, -max_val, max_val)
 void metal_enqueue_clamp(MetalBuf *x, float max_val, int n);
 
+// Fused SGD: dW = dY^T @ X, then W -= lr * dW (F16 in-place)
+void metal_enqueue_f16_sgd_fused(MetalBuf *W, MetalBuf *dY, MetalBuf *X,
+                                   int M, int K, int N, float lr);
+
+// GRPO policy gradient: PPO-clip loss gradient for N positions, vocab size V
+void metal_enqueue_grpo_policy_grad(MetalBuf *logits, MetalBuf *actions,
+    MetalBuf *old_lp, MetalBuf *advs, MetalBuf *new_lp, MetalBuf *dlogits,
+    int N, int V, float clip_eps);
+
+// Fused grad accumulation: G[M,N] += dY[K,M]^T @ X[K,N] (F16 accumulator)
+void metal_enqueue_f16_grad_accum(MetalBuf *G, MetalBuf *dY, MetalBuf *X,
+                                    int M, int K, int N);
+
+// Apply accumulated gradient with SGD: W -= lr * G, then G = 0 (element-wise, F16)
+void metal_enqueue_f16_sgd_apply(MetalBuf *W, MetalBuf *G, int n, float lr);
+
 #endif // FAST_METAL_H

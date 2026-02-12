@@ -48,6 +48,13 @@ static int parse_eos_from_config(const char *model_path, int *eos_out, int max_e
     return count;
 }
 
+// Per-layer LoRA weight references for inference (shared from SFT)
+typedef struct {
+    MetalBuf *A_q, *B_q, *A_v, *B_v;   // float GPU buffers (owned by SFT)
+    int R;                               // LoRA rank
+    float scaling;                       // alpha / rank
+} InfLoRA;
+
 struct InferenceState {
     int d_model, n_q_heads, n_kv_heads, head_dim, intermediate_size, vocab_size;
     int n_layers, max_seq_len;
@@ -78,6 +85,13 @@ struct InferenceState {
     WMat *lm_head;
     MetalBuf *mb_final_norm_g;
     const float *token_emb;
+
+    // LoRA for inference (optional, set via inference_state_set_lora)
+    InfLoRA *lora;          // [n_layers], NULL if no LoRA
+    MetalBuf *mb_lora_tmp;  // scratch [R] for LoRA matvec
+    MetalBuf *mb_lora_out;  // scratch [max(Hq*hd, Hkv*hd)] for LoRA output
+
+    int owns_weights;       // 1 = free weights on destroy, 0 = shared from SFT
 };
 
 static MetalBuf *make_buf(size_t bytes, float **cpu_ptr) {
@@ -232,6 +246,7 @@ static InferenceState *inference_state_init_common(
     s->lm_head = wmat_convert(lm_head_data, vocab_size, d_model, use_fp16);
     s->mb_final_norm_g = norm_upload(final_norm_gamma, d_model);
     s->token_emb = token_emb_data;
+    s->owns_weights = 1;
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
@@ -333,15 +348,23 @@ void inference_state_free(InferenceState *s) {
     metal_buf_free(s->mb_attn_out);
     metal_buf_free(s->mb_gate); metal_buf_free(s->mb_up);
     metal_buf_free(s->mb_ff_out); metal_buf_free(s->mb_logits);
-    metal_buf_free(s->mb_final_norm_g);
     for (int i = 0; i < s->n_layers; i++) {
         metal_buf_free(s->mb_k_cache[i]);
         metal_buf_free(s->mb_v_cache[i]);
     }
     free(s->mb_k_cache); free(s->mb_v_cache);
     free(s->rope_thetas);
-    layers_free(s->layers, s->n_layers);
-    wmat_free(s->lm_head);
+    if (s->owns_weights) {
+        layers_free(s->layers, s->n_layers);
+        wmat_free(s->lm_head);
+        metal_buf_free(s->mb_final_norm_g);
+    }
+    // LoRA refs are shared (owned by SFT), only free the scratch buffers and array
+    if (s->lora) {
+        metal_buf_free(s->mb_lora_tmp);
+        metal_buf_free(s->mb_lora_out);
+        free(s->lora);
+    }
     fast_metal_shutdown();
     free(s);
 }
@@ -378,6 +401,25 @@ static void forward_token(InferenceState *s, int token, int pos) {
         dispatch_matvec(s, lw->q_proj, s->mb_ln_out, s->mb_q);
         dispatch_matvec(s, lw->k_proj, s->mb_ln_out, s->mb_k);
         dispatch_matvec(s, lw->v_proj, s->mb_ln_out, s->mb_v);
+
+        // LoRA on Q and V (if attached)
+        if (s->lora) {
+            InfLoRA *lr = &s->lora[layer];
+            int Hq_hd = Hq * hd;
+            int Hkv_hd = Hkv * hd;
+            // Q += scaling * B_q @ (A_q @ ln_out)
+            metal_enqueue_float_matmul(s->mb_ln_out, lr->A_q, s->mb_lora_tmp,
+                                        1, lr->R, D);
+            metal_enqueue_float_matmul(s->mb_lora_tmp, lr->B_q, s->mb_lora_out,
+                                        1, Hq_hd, lr->R);
+            metal_enqueue_add_scaled(s->mb_q, s->mb_lora_out, lr->scaling, Hq_hd);
+            // V += scaling * B_v @ (A_v @ ln_out)
+            metal_enqueue_float_matmul(s->mb_ln_out, lr->A_v, s->mb_lora_tmp,
+                                        1, lr->R, D);
+            metal_enqueue_float_matmul(s->mb_lora_tmp, lr->B_v, s->mb_lora_out,
+                                        1, Hkv_hd, lr->R);
+            metal_enqueue_add_scaled(s->mb_v, s->mb_lora_out, lr->scaling, Hkv_hd);
+        }
         if (lw->q_norm_g)
             metal_enqueue_per_head_rms_norm(s->mb_q, lw->q_norm_g, Hq, hd, eps);
         if (lw->k_norm_g)
@@ -431,6 +473,138 @@ static int argmax(const float *v, int n) {
         if (v[i] > best_val) { best_val = v[i]; best = i; }
     }
     return best;
+}
+
+// ==================================================================
+// Public API: reset, forward_token, vocab_size, set_lora
+// ==================================================================
+
+int inference_state_vocab_size(InferenceState *state) {
+    return state->vocab_size;
+}
+
+void inference_state_reset(InferenceState *state) {
+    state->cur_len = 0;
+}
+
+const float *inference_forward_token(InferenceState *state, int token) {
+    forward_token(state, token, state->cur_len);
+    state->cur_len++;
+    return state->logits;
+}
+
+void inference_state_set_lora(InferenceState *state, SFTState *sft) {
+    int NL = state->n_layers;
+    int R = sft_get_lora_rank(sft);
+    if (R == 0) return;  // full-param: no LoRA
+    int Hq_hd = state->n_q_heads * state->head_dim;
+    int Hkv_hd = state->n_kv_heads * state->head_dim;
+    float scaling = sft_get_lora_scaling(sft);
+
+    if (!state->lora) {
+        state->lora = calloc(NL, sizeof(InfLoRA));
+        // Scratch buffers for LoRA matvec (M=1)
+        state->mb_lora_tmp = metal_buf_create(R * sizeof(float));
+        int max_hd = Hq_hd > Hkv_hd ? Hq_hd : Hkv_hd;
+        state->mb_lora_out = metal_buf_create(max_hd * sizeof(float));
+    }
+
+    for (int L = 0; L < NL; L++) {
+        state->lora[L].A_q = sft_get_lora_weight_buf(sft, L, 0);
+        state->lora[L].B_q = sft_get_lora_weight_buf(sft, L, 1);
+        state->lora[L].A_v = sft_get_lora_weight_buf(sft, L, 2);
+        state->lora[L].B_v = sft_get_lora_weight_buf(sft, L, 3);
+        state->lora[L].R = R;
+        state->lora[L].scaling = scaling;
+    }
+}
+
+// ==================================================================
+// Create inference state sharing weights from SFTState (no duplicate upload)
+// ==================================================================
+
+InferenceState *inference_state_create_from_sft(SFTState *sft, int max_seq_len) {
+    if (fast_metal_init() != 0) {
+        fprintf(stderr, "[FastGen] Metal init failed\n");
+        return NULL;
+    }
+    if (max_seq_len > 4096) {
+        fprintf(stderr, "[FastGen] Warning: clamping max_seq_len to 4096\n");
+        max_seq_len = 4096;
+    }
+
+    int D = sft_get_d_model(sft);
+    int NL = sft_get_n_layers(sft);
+    int V = sft_get_vocab_size(sft);
+    int n_q_heads = sft_get_n_q_heads(sft);
+    int n_kv_heads = sft_get_n_kv_heads(sft);
+    int head_dim = sft_get_head_dim(sft);
+    int IS = sft_get_intermediate_size(sft);
+    ModelType mtype = sft_get_model_type(sft);
+
+    InferenceState *s = calloc(1, sizeof(InferenceState));
+    s->d_model = D;
+    s->n_q_heads = n_q_heads;
+    s->n_kv_heads = n_kv_heads;
+    s->head_dim = head_dim;
+    s->intermediate_size = IS;
+    s->vocab_size = V;
+    s->n_layers = NL;
+    s->max_seq_len = max_seq_len;
+    s->use_fp16 = 1;  // SFT is always F16
+    s->model_type = mtype;
+    s->owns_weights = 0;  // shared from SFT
+
+    // Default EOS
+    if (mtype == MODEL_GEMMA3) {
+        s->eos_tokens[0] = 1;    s->eos_tokens[1] = 106;  s->n_eos = 2;
+    } else {
+        s->eos_tokens[0] = 151645; s->eos_tokens[1] = 151643; s->n_eos = 2;
+    }
+
+    // Copy rope thetas from SFT
+    const float *sft_thetas = sft_get_rope_thetas(sft);
+    s->rope_thetas = malloc(NL * sizeof(float));
+    memcpy(s->rope_thetas, sft_thetas, NL * sizeof(float));
+
+    int Hq_hd = n_q_heads * head_dim;
+    int Hkv_hd = n_kv_heads * head_dim;
+
+    // Scratch buffers (inference-specific, not shared)
+    s->mb_x       = make_buf(D * sizeof(float), &s->x);
+    s->mb_x2      = make_buf(D * sizeof(float), NULL);
+    s->mb_ln_out  = make_buf(D * sizeof(float), NULL);
+    s->mb_q       = make_buf(Hq_hd * sizeof(float), NULL);
+    s->mb_k       = make_buf(Hkv_hd * sizeof(float), NULL);
+    s->mb_v       = make_buf(Hkv_hd * sizeof(float), NULL);
+    s->mb_attn_out = make_buf(Hq_hd * sizeof(float), NULL);
+    s->mb_gate    = make_buf(IS * sizeof(float), NULL);
+    s->mb_up      = make_buf(IS * sizeof(float), NULL);
+    s->mb_ff_out  = make_buf(D * sizeof(float), NULL);
+    s->mb_logits  = make_buf(V * sizeof(float), &s->logits);
+
+    // KV cache (inference-specific)
+    size_t cache_bytes = (size_t)n_kv_heads * max_seq_len * head_dim * sizeof(float);
+    s->mb_k_cache = calloc(NL, sizeof(MetalBuf *));
+    s->mb_v_cache = calloc(NL, sizeof(MetalBuf *));
+    for (int i = 0; i < NL; i++) {
+        s->mb_k_cache[i] = metal_buf_create(cache_bytes);
+        s->mb_v_cache[i] = metal_buf_create(cache_bytes);
+    }
+    s->cur_len = 0;
+
+    // Share weights from SFT (no upload, no copy)
+    s->layers = sft_get_layers(sft);
+    s->lm_head = sft_get_lm_head(sft);
+    s->mb_final_norm_g = sft_get_final_norm_g(sft);
+    s->token_emb = sft_get_token_emb(sft);
+
+    // Share LoRA too
+    inference_state_set_lora(s, sft);
+
+    fprintf(stderr, "[FastGen] Created from SFT (shared weights, %.1f MB saved)\n",
+           0.0);  // actual saving depends on model size
+    return s;
 }
 
 // ==================================================================

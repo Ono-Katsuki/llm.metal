@@ -56,16 +56,24 @@ static id<MTLComputePipelineState> g_buf_copy_ps = nil;
 static id<MTLComputePipelineState> g_clamp_ps = nil;
 static id<MTLComputePipelineState> g_gelu_mul = nil;
 static id<MTLComputePipelineState> g_gelu_mul_bwd_ps = nil;
+static id<MTLComputePipelineState> g_grpo_pg_ps = nil;
+static id<MTLComputePipelineState> g_f16_sgd_fused_ps = nil;
+static id<MTLComputePipelineState> g_f16_grad_accum_ps = nil;
+static id<MTLComputePipelineState> g_f16_sgd_apply_ps = nil;
 
 // Single command buffer + encoder reused across all dispatches per flush
 static id<MTLCommandBuffer> g_cmdbuf;
 static id<MTLComputeCommandEncoder> g_enc;
+
+// Reference counting for safe multi-init (inference + SFT share Metal state)
+static int g_init_refcount = 0;
 
 // ===================================================================
 // Init / Shutdown
 // ===================================================================
 
 int fast_metal_init(void) {
+    if (g_init_refcount++ > 0) return 0;  // already initialized
     @autoreleasepool {
         g_dev = MTLCreateSystemDefaultDevice();
         if (!g_dev) {
@@ -142,6 +150,10 @@ int fast_metal_init(void) {
         MAKE_PSO(g_clamp_ps,            "clamp_tensor");
         MAKE_PSO(g_gelu_mul,            "gelu_mul");
         MAKE_PSO(g_gelu_mul_bwd_ps,     "gelu_mul_backward");
+        MAKE_PSO(g_grpo_pg_ps,          "grpo_policy_grad");
+        MAKE_PSO(g_f16_sgd_fused_ps,   "f16_sgd_fused");
+        MAKE_PSO(g_f16_grad_accum_ps,  "f16_grad_accum");
+        MAKE_PSO(g_f16_sgd_apply_ps,   "f16_sgd_apply");
 
         #undef MAKE_PSO
 
@@ -156,6 +168,7 @@ int fast_metal_init(void) {
 }
 
 void fast_metal_shutdown(void) {
+    if (--g_init_refcount > 0) return;  // other users still active
     g_q8_matvec = nil; g_f16_matvec = nil; g_f16_batch_matvec = nil;
     g_rms_norm = nil; g_per_head_rms_norm = nil;
     g_rope = nil; g_kv_cache_store = nil; g_attention = nil;
@@ -170,6 +183,9 @@ void fast_metal_shutdown(void) {
     g_repeat_kv_bwd_ps = nil; g_rope_train_bwd_ps = nil;
     g_float_matmul_ps = nil; g_float_matmul_tn_ps = nil; g_float_matmul_nt_ps = nil;
     g_buf_copy_ps = nil; g_clamp_ps = nil; g_gelu_mul = nil; g_gelu_mul_bwd_ps = nil;
+    g_grpo_pg_ps = nil;
+    g_f16_sgd_fused_ps = nil;
+    g_f16_grad_accum_ps = nil; g_f16_sgd_apply_ps = nil;
     g_enc = nil; g_cmdbuf = nil;
     g_queue = nil; g_dev = nil;
 }
@@ -920,6 +936,75 @@ void metal_enqueue_clamp(MetalBuf *x, float max_val, int n) {
     [enc setComputePipelineState:g_clamp_ps];
     [enc setBuffer:x->buf offset:0 atIndex:0];
     [enc setBytes:&max_val length:sizeof(max_val) atIndex:1];
+
+    [enc dispatchThreadgroups:MTLSizeMake((n + 255) / 256, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+}
+
+void metal_enqueue_f16_sgd_fused(MetalBuf *W, MetalBuf *dY, MetalBuf *X,
+                                   int M, int K, int N, float lr) {
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:g_f16_sgd_fused_ps];
+    [enc setBuffer:W->buf offset:0 atIndex:0];
+    [enc setBuffer:dY->buf offset:0 atIndex:1];
+    [enc setBuffer:X->buf offset:0 atIndex:2];
+    uint32_t M32 = (uint32_t)M, K32 = (uint32_t)K, N32 = (uint32_t)N;
+    [enc setBytes:&M32 length:sizeof(M32) atIndex:3];
+    [enc setBytes:&K32 length:sizeof(K32) atIndex:4];
+    [enc setBytes:&N32 length:sizeof(N32) atIndex:5];
+    [enc setBytes:&lr length:sizeof(lr) atIndex:6];
+
+    [enc dispatchThreadgroups:MTLSizeMake((N + 15) / 16, (M + 15) / 16, 1)
+        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    barrier();
+}
+
+void metal_enqueue_grpo_policy_grad(MetalBuf *logits, MetalBuf *actions,
+    MetalBuf *old_lp, MetalBuf *advs, MetalBuf *new_lp, MetalBuf *dlogits,
+    int N, int V, float clip_eps) {
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:g_grpo_pg_ps];
+    [enc setBuffer:logits->buf offset:0 atIndex:0];
+    [enc setBuffer:actions->buf offset:0 atIndex:1];
+    [enc setBuffer:old_lp->buf offset:0 atIndex:2];
+    [enc setBuffer:advs->buf offset:0 atIndex:3];
+    [enc setBuffer:new_lp->buf offset:0 atIndex:4];
+    [enc setBuffer:dlogits->buf offset:0 atIndex:5];
+    uint32_t V32 = (uint32_t)V;
+    [enc setBytes:&V32 length:sizeof(V32) atIndex:6];
+    [enc setBytes:&clip_eps length:sizeof(clip_eps) atIndex:7];
+
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+}
+
+void metal_enqueue_f16_grad_accum(MetalBuf *G, MetalBuf *dY, MetalBuf *X,
+                                    int M, int K, int N) {
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:g_f16_grad_accum_ps];
+    [enc setBuffer:G->buf offset:0 atIndex:0];
+    [enc setBuffer:dY->buf offset:0 atIndex:1];
+    [enc setBuffer:X->buf offset:0 atIndex:2];
+    uint32_t M32 = (uint32_t)M, K32 = (uint32_t)K, N32 = (uint32_t)N;
+    [enc setBytes:&M32 length:sizeof(M32) atIndex:3];
+    [enc setBytes:&K32 length:sizeof(K32) atIndex:4];
+    [enc setBytes:&N32 length:sizeof(N32) atIndex:5];
+
+    [enc dispatchThreadgroups:MTLSizeMake((N + 15) / 16, (M + 15) / 16, 1)
+        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    barrier();
+}
+
+void metal_enqueue_f16_sgd_apply(MetalBuf *W, MetalBuf *G, int n, float lr) {
+    id<MTLComputeCommandEncoder> enc = get_encoder();
+    [enc setComputePipelineState:g_f16_sgd_apply_ps];
+    [enc setBuffer:W->buf offset:0 atIndex:0];
+    [enc setBuffer:G->buf offset:0 atIndex:1];
+    uint32_t n32 = (uint32_t)n;
+    [enc setBytes:&n32 length:sizeof(n32) atIndex:2];
+    [enc setBytes:&lr length:sizeof(lr) atIndex:3];
 
     [enc dispatchThreadgroups:MTLSizeMake((n + 255) / 256, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];

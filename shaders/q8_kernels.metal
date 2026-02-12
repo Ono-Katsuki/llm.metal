@@ -690,6 +690,77 @@ kernel void softmax_ce_train(
 }
 
 // ===================================================================
+// GRPO policy gradient: compute PPO-clip gradient for one position
+// One threadgroup per position (bid), 256 threads.
+// logits[bid*V .. (bid+1)*V-1], actions[bid], old_logprobs[bid], advantages[bid]
+// Outputs: new_logprobs[bid], dlogits[bid*V .. (bid+1)*V-1]
+// ===================================================================
+kernel void grpo_policy_grad(
+    device const float *logits       [[buffer(0)]],   // [N * V]
+    device const uint  *actions      [[buffer(1)]],   // [N]
+    device const float *old_logprobs [[buffer(2)]],   // [N]
+    device const float *advantages   [[buffer(3)]],   // [N]
+    device float       *new_logprobs [[buffer(4)]],   // [N] output
+    device float       *dlogits      [[buffer(5)]],   // [N * V] output
+    constant uint &V                 [[buffer(6)]],
+    constant float &clip_eps         [[buffer(7)]],
+    uint bid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    uint off = bid * V;
+    uint action = actions[bid];
+    float old_lp = old_logprobs[bid];
+    float adv = advantages[bid];
+    threadgroup float shared[256];
+
+    // Pass 1: find max logit
+    float local_max = -1e30f;
+    for (uint i = tid; i < V; i += tg_size)
+        local_max = max(local_max, logits[off + i]);
+    shared[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] = max(shared[tid], shared[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_val = shared[0];
+
+    // Pass 2: sum exp
+    float local_sum = 0;
+    for (uint i = tid; i < V; i += tg_size)
+        local_sum += exp(logits[off + i] - max_val);
+    shared[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float logsumexp = log(shared[0]) + max_val;
+
+    // new log-prob
+    float new_lp = logits[off + action] - logsumexp;
+    if (tid == 0) new_logprobs[bid] = new_lp;
+
+    // PPO-clip weight
+    float ratio = exp(new_lp - old_lp);
+    float clipped = clamp(ratio, 1.0f - clip_eps, 1.0f + clip_eps);
+    float weight;
+    if (adv >= 0) {
+        weight = (ratio <= clipped) ? -adv : 0.0f;
+    } else {
+        weight = (ratio >= clipped) ? -adv : 0.0f;
+    }
+
+    // Gradient: weight * ratio * (softmax[i] - delta(i, action))
+    for (uint i = tid; i < V; i += tg_size) {
+        float prob = exp(logits[off + i] - logsumexp);
+        float delta = (i == action) ? 1.0f : 0.0f;
+        dlogits[off + i] = weight * ratio * (prob - delta);
+    }
+}
+
+// ===================================================================
 // Attention training forward: causal self-attention with probs saving
 // Q, K, V: [H, N, D] (K,V already expanded via repeat_kv)
 // out: [H, N, D], probs: [H, N, N]
@@ -1022,6 +1093,37 @@ kernel void float_matmul_tn(
     if (row < M && col < N) C[row * N + col] = sum;
 }
 
+// Fused SGD: dW[M,N] = dY[K,M]^T @ X[K,N], then W[M,N] -= lr * dW (F16 in-place)
+kernel void f16_sgd_fused(
+    device half        *W  [[buffer(0)]],  // [M, N] F16 read-modify-write
+    device const float *dY [[buffer(1)]],  // [K, M] transposed access
+    device const float *X  [[buffer(2)]],  // [K, N]
+    constant uint &M       [[buffer(3)]],
+    constant uint &K       [[buffer(4)]],
+    constant uint &N       [[buffer(5)]],
+    constant float &lr     [[buffer(6)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]])
+{
+    const uint T = 16;
+    threadgroup float tA[T][T+1];
+    threadgroup float tB[T][T+1];
+    uint row = gid.y * T + tid.y;
+    uint col = gid.x * T + tid.x;
+    float sum = 0;
+    for (uint t = 0; t < K; t += T) {
+        tA[tid.y][tid.x] = (row < M && t+tid.x < K) ? dY[(t+tid.x) * M + row] : 0;
+        tB[tid.y][tid.x] = (col < N && t+tid.y < K) ? X[(t+tid.y) * N + col] : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < T; k++) sum += tA[tid.y][k] * tB[k][tid.x];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < M && col < N) {
+        uint idx = row * N + col;
+        W[idx] = half(float(W[idx]) - lr * sum);
+    }
+}
+
 // Float matmul no-transpose: C[M,K] = A[M,N] @ W[N,K]
 kernel void float_matmul_nt(
     device const float *A [[buffer(0)]],
@@ -1056,6 +1158,51 @@ kernel void clamp_tensor(
     uint i [[thread_position_in_grid]])
 {
     x[i] = clamp(x[i], -max_val, max_val);
+}
+
+// Fused grad accumulation: G[M,N] += dY[K,M]^T @ X[K,N] (F16 accumulator, no lr)
+kernel void f16_grad_accum(
+    device half        *G  [[buffer(0)]],  // [M, N] F16 accumulator
+    device const float *dY [[buffer(1)]],  // [K, M] transposed access
+    device const float *X  [[buffer(2)]],  // [K, N]
+    constant uint &M       [[buffer(3)]],
+    constant uint &K       [[buffer(4)]],
+    constant uint &N       [[buffer(5)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]])
+{
+    const uint T = 16;
+    threadgroup float tA[T][T+1];
+    threadgroup float tB[T][T+1];
+    uint row = gid.y * T + tid.y;
+    uint col = gid.x * T + tid.x;
+    float sum = 0;
+    for (uint t = 0; t < K; t += T) {
+        tA[tid.y][tid.x] = (row < M && t+tid.x < K) ? dY[(t+tid.x) * M + row] : 0;
+        tB[tid.y][tid.x] = (col < N && t+tid.y < K) ? X[(t+tid.y) * N + col] : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < T; k++) sum += tA[tid.y][k] * tB[k][tid.x];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < M && col < N) {
+        uint idx = row * N + col;
+        G[idx] = half(float(G[idx]) + sum);
+    }
+}
+
+// Apply accumulated F16 gradient with SGD + zero clear
+// W -= lr * G, then G = 0
+kernel void f16_sgd_apply(
+    device half *W         [[buffer(0)]],
+    device half *G         [[buffer(1)]],
+    constant uint &n       [[buffer(2)]],
+    constant float &lr     [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i < n) {
+        W[i] = half(float(W[i]) - lr * float(G[i]));
+        G[i] = half(0.0h);
+    }
 }
 
 // Buffer copy: dst = src

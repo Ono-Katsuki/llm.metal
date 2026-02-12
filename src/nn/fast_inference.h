@@ -29,6 +29,26 @@ int inference_generate(InferenceState *state,
 // Get model type of inference state.
 ModelType inference_state_model_type(InferenceState *state);
 
+// Get vocab size of inference state.
+int inference_state_vocab_size(InferenceState *state);
+
+// Reset KV cache position to 0 (for restarting generation).
+void inference_state_reset(InferenceState *state);
+
+// Forward one token through the model, advancing cur_len.
+// Returns pointer to logits buffer (valid until next call).
+const float *inference_forward_token(InferenceState *state, int token);
+
+// Attach LoRA weights from SFT state for GRPO inference.
+// The LoRA GPU buffers are shared (not copied), so updates
+// from SFT backward are automatically visible to inference.
+#include "fast_sft.h"
+void inference_state_set_lora(InferenceState *state, SFTState *sft);
+
+// Create inference state sharing base weights + LoRA from SFTState.
+// No weight upload — saves ~50% weight memory. Always F16.
+InferenceState *inference_state_create_from_sft(SFTState *sft, int max_seq_len);
+
 // Load EOS token IDs from model's config.json.
 // Call after create — auto-detects eos_token_id (int or array).
 void inference_state_load_eos(InferenceState *state, const char *model_path);
