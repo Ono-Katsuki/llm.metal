@@ -21,8 +21,8 @@ No PyTorch, no Python runtime — just C, Objective-C, and Metal shaders.
 ## Features
 
 - **Inference**: Autoregressive generation with KV cache, F16 or Q8_0 matvec
-- **SFT Training**: LoRA fine-tuning (rank 16, Q/V projections) with AdamW — **Qwen3 / Gemma3 両対応**
-- **GRPO Training**: Group Relative Policy Optimization — LoRA / Full-param Online / Full-param Accurate の 3 モード
+- **SFT Training**: LoRA fine-tuning (rank 16, Q/V projections) with AdamW — Qwen3 & Gemma3
+- **GRPO Training**: Group Relative Policy Optimization — 3 modes: LoRA / Full-param Online / Full-param Accurate
 - **GPU Pipeline**: Single Metal command buffer — all ops (RMSNorm, RoPE, GQA, SwiGLU/GeGLU, matvec) in one GPU submission
 - **Weight Loading**: HuggingFace SafeTensors (multi-shard), GGUF
 - **Model Auto-detection**: Reads `config.json` to select Qwen3 or Gemma3 architecture
@@ -83,7 +83,7 @@ python3 tools/decode_tokens.py /tmp/generated_tokens.bin
 
 ### 5. LoRA SFT (Qwen3 / Gemma3)
 
-モデルタイプは `config.json` から自動判定されます。
+Model type is auto-detected from `config.json`.
 
 ```bash
 # Prepare training data
@@ -102,14 +102,14 @@ python3 tools/tokenize_sft.py --input data/sft.jsonl --output data/sft_tokens.bi
 
 ### 6. GRPO Training
 
-GRPO (Group Relative Policy Optimization) で強化学習ファインチューニング。
-3つのモードから選択可能：
+GRPO (Group Relative Policy Optimization) for RL fine-tuning.
+Three training modes available:
 
-| モード | フラグ | 説明 | メモリ増分 |
-|--------|--------|------|-----------|
-| LoRA | (デフォルト) | LoRA アダプター上で AdamW 更新 | 低 |
-| Full-param Online | `--full-param` | completion ごとに即座に SGD 更新（高速） | モデル重み F16 分 |
-| Full-param Accurate | `--accurate` | F16 勾配蓄積 → 全 completion 後に 1 回 SGD（論文通り） | モデル重み F16 × 2 |
+| Mode | Flag | Description | Memory overhead |
+|------|------|-------------|-----------------|
+| LoRA | (default) | AdamW on LoRA adapters | Low |
+| Full-param Online | `--full-param` | Per-completion fused SGD (fast) | Model weights in F16 |
+| Full-param Accurate | `--accurate` | F16 grad accumulation, single SGD after all completions (paper-correct) | Model weights in F16 x2 |
 
 ```bash
 # Prepare GRPO prompts
@@ -131,9 +131,9 @@ python3 tools/tokenize_grpo.py --input data/prompts.jsonl --output data/grpo_pro
   --accurate --group-size 4
 ```
 
-**メモリ目安 (M4 Pro 24GB):**
-- Gemma3-1B Accurate: ~1.9 GB (weights) + ~1.9 GB (grad accum) + KV cache 等
-- Qwen3-4B Accurate: ~7.7 GB (weights) + ~7.7 GB (grad accum) + KV cache 等
+**Memory estimates (M4 Pro 24GB):**
+- Gemma3-1B Accurate: ~1.9 GB (weights) + ~1.9 GB (grad accum) + KV cache etc.
+- Qwen3-4B Accurate: ~7.7 GB (weights) + ~7.7 GB (grad accum) + KV cache etc.
 
 ## Project Structure
 
